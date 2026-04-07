@@ -1,0 +1,19 @@
+{
+  "name": "pixelprint-agent",
+  "version": "1.0.0",
+  "description": "PixelPrint kiosk print agent — runs as a systemd/PM2 service on each kiosk machine",
+  "main": "agent.js",
+  "scripts": {
+    "start": "node agent.js",
+    "dev": "nodemon agent.js",
+    "install-service": "pm2 start agent.js --name pixelprint-agent && pm2 save && pm2 startup"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "socket.io-client": "^4.7.0",
+    "pdf-to-printer": "^5.6.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  }
+}

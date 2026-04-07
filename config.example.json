@@ -1,0 +1,5 @@
+{
+  "kioskId": "YOUR_KIOSK_ID",
+  "backendUrl": "https://printing-pixel-1.onrender.com",
+  "secret": "pixelprint-agent-2026"
+}
