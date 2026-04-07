@@ -229,8 +229,63 @@ socket.on("print:job", async (job) => {
 // ── Remote restart command ──────────────────────────────────────────────────
 
 socket.on("agent:restart", () => {
-  log.info("Remote restart command received — exiting (PM2/systemd will restart)")
-  process.exit(0)
+  log.info("Remote restart command received — restarting via PM2")
+  process.exit(0)   // PM2 restarts automatically
+})
+
+// ── OTA self-update command ─────────────────────────────────────────────────
+// Triggered by backend "agent:update" event.
+// Agent pulls latest code from GitHub, then restarts itself.
+
+socket.on("agent:update", async (data) => {
+  const targetVersion = data?.version || "latest"
+  log.info(`\n${"─".repeat(60)}`)
+  log.info(`🔄 OTA Update received — pulling ${targetVersion}`)
+
+  // Notify backend we started the update
+  socket.emit("update:started", { kioskId: KIOSK_ID, version: VERSION })
+
+  try {
+    const { execSync } = require("child_process")
+
+    // 1. Git pull latest code
+    log.info("  Running: git pull...")
+    const pullOutput = execSync("git pull", {
+      cwd: __dirname,
+      timeout: 60_000,
+      encoding: "utf8"
+    }).trim()
+    log.info(`  git pull: ${pullOutput}`)
+
+    // 2. Install any new dependencies
+    if (pullOutput !== "Already up to date.") {
+      log.info("  Running: npm install...")
+      execSync("npm install --production", {
+        cwd: __dirname,
+        timeout: 120_000,
+        encoding: "utf8"
+      })
+    }
+
+    log.info(`  ✅ Update complete — restarting agent`)
+    socket.emit("update:done", {
+      kioskId: KIOSK_ID,
+      success: true,
+      previousVersion: VERSION,
+      output: pullOutput
+    })
+
+    // Brief delay so the socket message goes through before exit
+    setTimeout(() => process.exit(0), 1000)
+
+  } catch (err) {
+    log.error(`  ❌ Update failed: ${err.message}`)
+    socket.emit("update:done", {
+      kioskId: KIOSK_ID,
+      success: false,
+      error: err.message
+    })
+  }
 })
 
 // ── Graceful shutdown ────────────────────────────────────────────────────────
