@@ -247,6 +247,69 @@ async function printFile(filePath, printOptions) {
   })
 }
 
+
+// ── Print to explicitly-named printer (SX/DX routing) ────────────────────────
+
+/**
+ * Print a file to a SPECIFIC named printer.
+ * Used by the SX/DX router in agent.js — bypasses auto-detection.
+ * @param {string} filePath     - Path to the file to print
+ * @param {string} printerName  - Exact OS printer name from config.json
+ * @param {object} printOptions - { copies, colorMode, duplex, pageRange }
+ */
+async function printFileToNamed(filePath, printerName, printOptions) {
+  const opts      = printOptions || {}
+  const copies    = Math.max(1, parseInt(opts.copies) || 1)
+  const colorBW   = opts.colorMode !== "color"
+  const duplex    = opts.duplex === "double"
+  const pageRange = buildLpPageRange(opts.pageRange)
+
+  log.info(`Routing to printer: "${printerName}" | Copies:${copies} | BW:${colorBW} | Duplex:${duplex}`)
+
+  // ── Windows ──────────────────────────────────────────────────────────────
+  if (process.platform === "win32") {
+    let pdfToPrinter
+    try { pdfToPrinter = require("pdf-to-printer") } catch (_) {
+      throw new Error("pdf-to-printer not installed. Run: npm install pdf-to-printer")
+    }
+
+    const sumatraOk = await trySumatraPrint(filePath, printerName, copies)
+    if (sumatraOk) return
+
+    await pdfToPrinter.print(filePath, { printer: printerName, copies })
+    log.info(`Print submitted (pdf-to-printer) → "${printerName}": ${path.basename(filePath)}`)
+    return
+  }
+
+  // ── Linux / macOS — CUPS lp ───────────────────────────────────────────────
+  const lpArgs = [
+    "lp",
+    `-d "${printerName}"`,
+    `-n ${copies}`,
+    "-o media=A4",
+    "-o fit-to-page",
+    duplex ? "-o sides=two-sided-long-edge" : "-o sides=one-sided",
+    colorBW ? "-o ColorModel=Gray" : "",
+    pageRange,
+    `"${filePath}"`
+  ].filter(Boolean).join(" ")
+
+  log.info(`lp command (named): ${lpArgs}`)
+
+  return new Promise((resolve, reject) => {
+    exec(lpArgs, (error, stdout, stderr) => {
+      if (error) {
+        log.error(`lp error: ${error.message}`)
+        reject(new Error(`Print failed: ${error.message}`))
+        return
+      }
+      log.info(`Print submitted → "${printerName}": ${path.basename(filePath)} | ${stdout.trim()}`)
+      resolve(stdout)
+    })
+  })
+}
+
+
 // ── Safe file cleanup ────────────────────────────────────────────────────────
 
 function cleanup(filePaths) {
@@ -265,5 +328,8 @@ module.exports = {
   normalizePdfToA4,
   imageToA4Pdf,
   printFile,
+  printFileToNamed,
   cleanup
 }
+
+

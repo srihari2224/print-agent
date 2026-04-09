@@ -1,5 +1,8 @@
 {
-  "kioskId": "YOUR_KIOSK_ID",
+  "kioskId":    "YOUR_KIOSK_ID",
   "backendUrl": "https://printing-pixel-1.onrender.com",
-  "secret": "pixelprint-agent-2026"
+  "secret":     "pixelprint-agent-2026",
+
+  "printer1":   "HP_Color_LaserJet",
+  "printer2":   null
 }
