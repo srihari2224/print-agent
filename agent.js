@@ -304,31 +304,37 @@ socket.on("agent:update", async (data) => {
   try {
     const { execSync } = require("child_process")
 
-    // 1. Git pull latest code
-    log.info("  Running: git pull...")
-    const pullOutput = execSync("git pull", {
+    // 1. Fetch latest from remote (never fails due to divergence)
+    log.info("  Running: git fetch origin...")
+    execSync("git fetch origin", {
       cwd: __dirname,
       timeout: 60_000,
       encoding: "utf8"
-    }).trim()
-    log.info(`  git pull: ${pullOutput}`)
+    })
 
-    // 2. Install any new dependencies
-    if (pullOutput !== "Already up to date.") {
-      log.info("  Running: npm install...")
-      execSync("npm install --production", {
-        cwd: __dirname,
-        timeout: 120_000,
-        encoding: "utf8"
-      })
-    }
+    // 2. Hard reset to origin/main — discards any local changes / divergence
+    log.info("  Running: git reset --hard origin/main...")
+    const resetOutput = execSync("git reset --hard origin/main", {
+      cwd: __dirname,
+      timeout: 30_000,
+      encoding: "utf8"
+    }).trim()
+    log.info(`  git reset: ${resetOutput}`)
+
+    // 3. Install any new dependencies
+    log.info("  Running: npm install --production...")
+    execSync("npm install --production", {
+      cwd: __dirname,
+      timeout: 120_000,
+      encoding: "utf8"
+    })
 
     log.info(`  ✅ Update complete — restarting agent`)
     socket.emit("update:done", {
       kioskId: KIOSK_ID,
       success: true,
       previousVersion: VERSION,
-      output: pullOutput
+      output: resetOutput
     })
 
     // Brief delay so the socket message goes through before exit
@@ -343,6 +349,7 @@ socket.on("agent:update", async (data) => {
     })
   }
 })
+
 
 // ── Graceful shutdown ────────────────────────────────────────────────────────
 
