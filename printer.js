@@ -281,25 +281,32 @@ async function printFileToNamed(filePath, printerName, printOptions) {
     return
   }
 
-  // ── Linux / macOS — CUPS lp ───────────────────────────────────────────────
-  const lpArgs = [
-    "lp",
-    `-d "${printerName}"`,
-    `-n ${copies}`,
-    "-o media=A4",
-    "-o fit-to-page",
-    duplex ? "-o sides=two-sided-long-edge" : "-o sides=one-sided",
-    colorBW ? "-o ColorModel=Gray" : "",
-    pageRange,
-    `"${filePath}"`
-  ].filter(Boolean).join(" ")
+  // ── Linux / macOS — CUPS lp ──────────────────────────────────────────
+  const { execFile } = require("child_process")
 
-  log.info(`lp command (named): ${lpArgs}`)
+  const lpArgs = [
+    "-d", printerName,
+    "-n", String(copies),
+    "-o", "media=A4",
+    "-o", "fit-to-page",
+    "-o", duplex ? "sides=two-sided-long-edge" : "sides=one-sided",
+  ]
+
+  if (pageRange) {
+    // pageRange from buildLpPageRange returns e.g. "-o page-ranges=1-3"
+    const pr = pageRange.replace(/^-o /, "")
+    if (pr) lpArgs.push("-o", pr)
+  }
+
+  lpArgs.push(filePath)
+
+  log.info(`lp command (named): lp ${lpArgs.join(" ")}`)
 
   return new Promise((resolve, reject) => {
-    exec(lpArgs, (error, stdout, stderr) => {
+    execFile("lp", lpArgs, (error, stdout, stderr) => {
       if (error) {
         log.error(`lp error: ${error.message}`)
+        if (stderr) log.error(`lp stderr: ${stderr}`)
         reject(new Error(`Print failed: ${error.message}`))
         return
       }
@@ -311,6 +318,7 @@ async function printFileToNamed(filePath, printerName, printOptions) {
 
 
 // ── Safe file cleanup ────────────────────────────────────────────────────────
+
 
 function cleanup(filePaths) {
   for (const f of filePaths) {
