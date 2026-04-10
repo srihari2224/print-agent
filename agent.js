@@ -41,10 +41,11 @@ try {
   process.exit(1)
 }
 
-const KIOSK_ID   = config.kioskId
-const BACKEND    = (config.backendUrl || "https://printing-pixel-1.onrender.com").replace(/\/$/, "")
-const SECRET     = config.secret || "pixelprint-agent-2026"
-const VERSION    = require("./package.json").version
+const KIOSK_ID      = config.kioskId
+const BACKEND       = (config.backendUrl || "https://printing-pixel-1.onrender.com").replace(/\/$/, "")
+const KIOSK_BACKEND = (config.kioskBackendUrl || "https://kiosk-backend-t1mi.onrender.com").replace(/\/$/, "")
+const SECRET        = config.secret || "pixelprint-agent-2026"
+const VERSION       = require("./package.json").version
 
 // ── SX / DX routing constants ────────────────────────────────────────────────
 // printer2 being null/absent means SX (single printer). Both colour and B&W
@@ -255,7 +256,7 @@ socket.on("print:job", async (job) => {
   if (sheetsP1 > 0 || sheetsP2 > 0) {
     try {
       const kioskRes = await axios.get(
-        `${BACKEND}/api/kiosk/${KIOSK_ID}`,
+        `${KIOSK_BACKEND}/api/kiosk/${KIOSK_ID}`,
         { timeout: 10_000 }
       )
       const kiosk = kioskRes.data?.kiosk
@@ -265,7 +266,7 @@ socket.on("print:job", async (job) => {
         const newP1 = Math.max(0, curP1 - sheetsP1)
         const newP2 = Math.max(0, curP2 - sheetsP2)
         await axios.put(
-          `${BACKEND}/api/kiosk/${KIOSK_ID}/paper`,
+          `${KIOSK_BACKEND}/api/kiosk/${KIOSK_ID}/paper`,
           { printer1Paper: newP1, printer2Paper: newP2 },
           { timeout: 10_000 }
         )
