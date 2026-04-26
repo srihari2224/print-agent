@@ -158,6 +158,38 @@ function buildLpPageRange(pageRange) {
   return `-o page-ranges=${pageRange.trim()}`
 }
 
+// ── CUPS job completion poller ─────────────────────────────────────────────────────
+// lp submits a job to CUPS and returns IMMEDIATELY (the job is queued).
+// The printer may still be physically printing for minutes afterward.
+// This helper polls `lpstat` every 2 s until the job ID disappears from
+// the active queue, which means the printer has finished (or the job was
+// cancelled / errored).  We must await this before marking a job COMPLETED.
+
+async function waitForCupsJob(jobId, timeoutMs = 300_000) {
+  if (!jobId) return
+  log.info(`  Waiting for CUPS job: ${jobId}`)
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    const stillActive = await new Promise(resolve => {
+      exec(`lpstat -l -j ${jobId} 2>/dev/null`, (_err, stdout) => {
+        // lpstat returns output while the job is in the queue.
+        // When it returns nothing, the job is done.
+        resolve(!!(stdout && stdout.trim()))
+      })
+    })
+
+    if (!stillActive) {
+      log.info(`  CUPS job ${jobId} finished ✔`)
+      return
+    }
+
+    await new Promise(r => setTimeout(r, 2000))
+  }
+
+  log.warn(`  CUPS job ${jobId} still active after ${timeoutMs / 1000}s — proceeding anyway`)
+}
+
 // ── Main print function ──────────────────────────────────────────────────────
 
 /**
@@ -281,7 +313,7 @@ async function printFileToNamed(filePath, printerName, printOptions) {
     return
   }
 
-  // ── Linux / macOS — CUPS lp ──────────────────────────────────────────
+  // ── Linux / macOS — CUPS lp ───────────────────────────────────────────
   const { execFile } = require("child_process")
 
   const lpArgs = [
@@ -293,7 +325,6 @@ async function printFileToNamed(filePath, printerName, printOptions) {
   ]
 
   if (pageRange) {
-    // pageRange from buildLpPageRange returns e.g. "-o page-ranges=1-3"
     const pr = pageRange.replace(/^-o /, "")
     if (pr) lpArgs.push("-o", pr)
   }
@@ -303,14 +334,22 @@ async function printFileToNamed(filePath, printerName, printOptions) {
   log.info(`lp command (named): lp ${lpArgs.join(" ")}`)
 
   return new Promise((resolve, reject) => {
-    execFile("lp", lpArgs, (error, stdout, stderr) => {
+    execFile("lp", lpArgs, async (error, stdout, stderr) => {
       if (error) {
         log.error(`lp error: ${error.message}`)
         if (stderr) log.error(`lp stderr: ${stderr}`)
         reject(new Error(`Print failed: ${error.message}`))
         return
       }
+
       log.info(`Print submitted → "${printerName}": ${path.basename(filePath)} | ${stdout.trim()}`)
+
+      // Extract CUPS job ID: "request id is PRINTER_NAME-42 (1 file(s))"
+      const jobId = (stdout.match(/request id is (\S+)/) || [])[1]
+
+      // Wait for CUPS to actually finish printing (lp is asynchronous)
+      await waitForCupsJob(jobId)
+
       resolve(stdout)
     })
   })
