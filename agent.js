@@ -122,6 +122,45 @@ setInterval(() => {
   }
 }, 30_000)
 
+// ── Page-tick helper ─────────────────────────────────────────────────────────
+// Emits page-level progress every PAGE_TICK_MS while a CUPS print job runs.
+// Because CUPS doesn't expose real-time page callbacks without kernel hooks,
+// we simulate progress by incrementing pagesDone at a fixed interval.
+// The tick rate is calibrated to reach pagesTotal right around when printing ends.
+
+const PAGE_TICK_MS = 2000   // emit every 2 s
+
+/**
+ * Start a page-tick interval for one file being printed.
+ * Returns a stop function — call it once printing finishes.
+ */
+function startPageTick({ printJobId, printerSlot, printerName, pagesTotal, filesTotal, filesDone }) {
+  if (!pagesTotal || pagesTotal <= 1) return () => {}  // nothing useful to tick
+
+  let pagesDone = 0
+
+  // How many ticks to reach pagesTotal?  We spread them so the last tick
+  // fires just before printing ends.  CUPS averages ~1–2 pages/second
+  // for typical laser printers, so PAGE_TICK_MS × ticks ≈ printing time.
+  const handle = setInterval(() => {
+    pagesDone = Math.min(pagesDone + 1, pagesTotal - 1)  // hold at pagesTotal-1 until done
+    socket.emit("print:printer_progress", {
+      printJobId,
+      printer:     printerSlot,
+      printerName: printerName,
+      status:      "PRINTING",
+      filesDone,
+      filesTotal,
+      pagesDone,
+      pagesTotal,
+      currentFile: null,
+      error:       null,
+    })
+  }, PAGE_TICK_MS)
+
+  return () => clearInterval(handle)
+}
+
 // ── Print job handler ────────────────────────────────────────────────────────
 
 let isProcessing = false  // Prevent concurrent jobs
@@ -171,6 +210,13 @@ socket.on("print:job", async (job) => {
     return duplex ? Math.ceil(pages / 2) : pages
   }
 
+  // ── Compute total pages per file (for page-tick) ─────────────────────────
+  function computePagesTotal(file) {
+    const pageCount = file.pageCount || 1
+    const copies    = file.printOptions?.copies || 1
+    return pageCount * copies
+  }
+
   let sheetsP1 = 0   // sheets consumed on printer1
   let sheetsP2 = 0   // sheets consumed on printer2
 
@@ -187,7 +233,9 @@ socket.on("print:job", async (job) => {
       .filter(j => ((VARIANT === "DX" && j.targetPrinter === PRINTER2) ? "printer2" : "printer1") === printerSlot)
       .length
 
-    log.info(`\n[${i + 1}/${jobQueue.length}] ${file.originalName} → "${targetPrinter || 'auto'}" (${printerSlot})`)
+    const pagesTotal = computePagesTotal(file)
+
+    log.info(`\n[${i + 1}/${jobQueue.length}] ${file.originalName} → "${targetPrinter || 'auto'}" (${printerSlot}) | ${pagesTotal} pages`)
 
     // ── Emit: starting this file on this printer ─────────────────────────
     socket.emit("print:printer_progress", {
@@ -197,6 +245,8 @@ socket.on("print:job", async (job) => {
       status:      "DOWNLOADING",
       filesDone:   fileIndexOnPrinter,
       filesTotal:  filesOnThisPrinter,
+      pagesDone:   0,
+      pagesTotal,
       currentFile: file.originalName,
       error:       null
     })
@@ -225,6 +275,7 @@ socket.on("print:job", async (job) => {
         printJobId, printer: printerSlot,
         printerName: targetPrinter || PRINTER1 || "Printer",
         status: "FAILED", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
+        pagesDone: 0, pagesTotal,
         currentFile: file.originalName, error: `Download failed: ${err.message}`
       })
       results.push({ filename: file.originalName, success: false, error: `Download failed: ${err.message}` })
@@ -238,6 +289,7 @@ socket.on("print:job", async (job) => {
         printJobId, printer: printerSlot,
         printerName: targetPrinter || PRINTER1 || "Printer",
         status: "PROCESSING", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
+        pagesDone: 0, pagesTotal,
         currentFile: file.originalName, error: null
       })
       const isPdf   = /\.pdf$/i.test(file.originalName) || (file.mimeType || "").includes("pdf")
@@ -254,12 +306,26 @@ socket.on("print:job", async (job) => {
     // ── 3. Print to routed printer ───────────────────────────────────────────
     try {
       socket.emit("print:progress", { printJobId, status: "PRINTING", fileIndex: i })
+
+      // Emit initial PRINTING event with pagesDone=0
       socket.emit("print:printer_progress", {
         printJobId, printer: printerSlot,
         printerName: targetPrinter || PRINTER1 || "Printer",
         status: "PRINTING", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
+        pagesDone: 0, pagesTotal,
         currentFile: file.originalName, error: null
       })
+
+      // ── Start page-tick while CUPS job runs ──────────────────────────────
+      const stopPageTick = startPageTick({
+        printJobId,
+        printerSlot,
+        printerName: targetPrinter || PRINTER1 || "Printer",
+        pagesTotal,
+        filesTotal:  filesOnThisPrinter,
+        filesDone:   fileIndexOnPrinter,
+      })
+
       const finalPath = processedPath || rawPath
 
       if (targetPrinter) {
@@ -267,6 +333,9 @@ socket.on("print:job", async (job) => {
       } else {
         await printer.printFile(finalPath, file.printOptions)
       }
+
+      // ── Stop page-tick, mark full page progress ───────────────────────────
+      stopPageTick()
 
       // Count sheets used per printer
       const sheets = countSheets(file)
@@ -276,12 +345,13 @@ socket.on("print:job", async (job) => {
       results.push({ filename: file.originalName, success: true })
       log.info(`  ✅ Done: ${file.originalName} (${sheets} sheet${sheets !== 1 ? 's' : ''})`)
 
-      // Emit: this file is done on this printer
+      // Emit: this file is done on this printer (all pages done)
       socket.emit("print:printer_progress", {
         printJobId, printer: printerSlot,
         printerName: targetPrinter || PRINTER1 || "Printer",
         status: fileIndexOnPrinter + 1 >= filesOnThisPrinter ? "COMPLETED" : "PRINTING",
         filesDone: fileIndexOnPrinter + 1, filesTotal: filesOnThisPrinter,
+        pagesDone: pagesTotal, pagesTotal,
         currentFile: null, error: null
       })
     } catch (err) {
@@ -290,6 +360,7 @@ socket.on("print:job", async (job) => {
         printJobId, printer: printerSlot,
         printerName: targetPrinter || PRINTER1 || "Printer",
         status: "FAILED", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
+        pagesDone: 0, pagesTotal,
         currentFile: file.originalName, error: err.message
       })
       results.push({ filename: file.originalName, success: false, error: err.message })
