@@ -1,3 +1,8 @@
+hi
+
+
+
+
 /**
  * agent.js — PixelPrint Print Agent
  * ─────────────────────────────────────────────────────────────────────────────
@@ -13,12 +18,12 @@
  *   }
  */
 
-const fs    = require("fs")
-const path  = require("path")
+const fs = require("fs")
+const path = require("path")
 const axios = require("axios")
 const { io } = require("socket.io-client")
 
-const log     = require("./logger")
+const log = require("./logger")
 const printer = require("./printer")
 
 // ── Load config ──────────────────────────────────────────────────────────────
@@ -41,19 +46,19 @@ try {
   process.exit(1)
 }
 
-const KIOSK_ID      = config.kioskId
-const BACKEND       = (config.backendUrl || "https://printing-pixel-1.onrender.com").replace(/\/$/, "")
+const KIOSK_ID = config.kioskId
+const BACKEND = (config.backendUrl || "https://printing-pixel-1.onrender.com").replace(/\/$/, "")
 const KIOSK_BACKEND = (config.kioskBackendUrl || "https://kiosk-backend-t1mi.onrender.com").replace(/\/$/, "")
-const SECRET        = config.secret || "pixelprint-agent-2026"
-const VERSION       = require("./package.json").version
+const SECRET = config.secret || "pixelprint-agent-2026"
+const VERSION = require("./package.json").version
 
 // ── SX / DX routing constants ────────────────────────────────────────────────
 // printer2 being null/absent means SX (single printer). Both colour and B&W
 // go to printer1. When printer2 is set, this is a DX kiosk: colour → printer1,
 // B&W → printer2.
-const PRINTER1   = config.printer1 || null           // colour / primary printer
-const PRINTER2   = config.printer2 || null           // B&W printer (DX only)
-const VARIANT    = PRINTER2 ? "DX" : "SX"           // auto-detected from config
+const PRINTER1 = config.printer1 || null           // colour / primary printer
+const PRINTER2 = config.printer2 || null           // B&W printer (DX only)
+const VARIANT = PRINTER2 ? "DX" : "SX"           // auto-detected from config
 
 log.info(`PixelPrint Agent v${VERSION} | Kiosk: ${KIOSK_ID} | Backend: ${BACKEND}`)
 log.info(`Variant: ${VARIANT} | Printer1: "${PRINTER1 || 'auto'}" | Printer2: ${PRINTER2 ? `"${PRINTER2}"` : 'N/A (SX)'}`)
@@ -135,7 +140,7 @@ const PAGE_TICK_MS = 2000   // emit every 2 s
  * Returns a stop function — call it once printing finishes.
  */
 function startPageTick({ printJobId, printerSlot, printerName, pagesTotal, filesTotal, filesDone }) {
-  if (!pagesTotal || pagesTotal <= 1) return () => {}  // nothing useful to tick
+  if (!pagesTotal || pagesTotal <= 1) return () => { }  // nothing useful to tick
 
   let pagesDone = 0
 
@@ -146,15 +151,15 @@ function startPageTick({ printJobId, printerSlot, printerName, pagesTotal, files
     pagesDone = Math.min(pagesDone + 1, pagesTotal - 1)  // hold at pagesTotal-1 until done
     socket.emit("print:printer_progress", {
       printJobId,
-      printer:     printerSlot,
+      printer: printerSlot,
       printerName: printerName,
-      status:      "PRINTING",
+      status: "PRINTING",
       filesDone,
       filesTotal,
       pagesDone,
       pagesTotal,
       currentFile: null,
-      error:       null,
+      error: null,
     })
   }, PAGE_TICK_MS)
 
@@ -180,13 +185,13 @@ socket.on("print:job", async (job) => {
   // Acknowledge receipt
   socket.emit("print:ack", { printJobId, kioskId: KIOSK_ID })
 
-  const workDir   = printer.getWorkDir()
-  const results   = []
+  const workDir = printer.getWorkDir()
+  const results = []
   const tempFiles = []
 
   // ── Classify files: color vs B&W ────────────────────────────────────────
   const colorFiles = files.filter(f => (f.printOptions?.colorMode || "bw") === "color")
-  const bwFiles    = files.filter(f => (f.printOptions?.colorMode || "bw") !== "color")
+  const bwFiles = files.filter(f => (f.printOptions?.colorMode || "bw") !== "color")
 
   log.info(`[${VARIANT}] Routing: ${colorFiles.length} color → "${PRINTER1 || 'auto'}" | ${bwFiles.length} B&W → "${VARIANT === "DX" ? (PRINTER2 || PRINTER1 || 'auto') : (PRINTER1 || 'auto')}"`)
 
@@ -196,24 +201,24 @@ socket.on("print:job", async (job) => {
   const jobQueue = VARIANT === "SX"
     ? files.map(f => ({ file: f, targetPrinter: PRINTER1 }))
     : [
-        ...colorFiles.map(f => ({ file: f, targetPrinter: PRINTER1 })),
-        ...bwFiles.map(f => ({ file: f, targetPrinter: PRINTER2 || PRINTER1 }))
-      ]
+      ...colorFiles.map(f => ({ file: f, targetPrinter: PRINTER1 })),
+      ...bwFiles.map(f => ({ file: f, targetPrinter: PRINTER2 || PRINTER1 }))
+    ]
 
   // ── Sheet counting per printer ────────────────────────────────────────────
   // Duplex: 1 sheet per 2 pages. Single-side: 1 sheet per page.
   function countSheets(file) {
     const pageCount = file.pageCount || 1
-    const copies    = file.printOptions?.copies || 1
-    const duplex    = file.printOptions?.duplex === "double"
-    const pages     = pageCount * copies
+    const copies = file.printOptions?.copies || 1
+    const duplex = file.printOptions?.duplex === "double"
+    const pages = pageCount * copies
     return duplex ? Math.ceil(pages / 2) : pages
   }
 
   // ── Compute total pages per file (for page-tick) ─────────────────────────
   function computePagesTotal(file) {
     const pageCount = file.pageCount || 1
-    const copies    = file.printOptions?.copies || 1
+    const copies = file.printOptions?.copies || 1
     return pageCount * copies
   }
 
@@ -240,18 +245,18 @@ socket.on("print:job", async (job) => {
     // ── Emit: starting this file on this printer ─────────────────────────
     socket.emit("print:printer_progress", {
       printJobId,
-      printer:     printerSlot,
+      printer: printerSlot,
       printerName: targetPrinter || PRINTER1 || "Printer",
-      status:      "DOWNLOADING",
-      filesDone:   fileIndexOnPrinter,
-      filesTotal:  filesOnThisPrinter,
-      pagesDone:   0,
+      status: "DOWNLOADING",
+      filesDone: fileIndexOnPrinter,
+      filesTotal: filesOnThisPrinter,
+      pagesDone: 0,
       pagesTotal,
       currentFile: file.originalName,
-      error:       null
+      error: null
     })
 
-    let rawPath       = null
+    let rawPath = null
     let processedPath = null
 
     // ── 1. Download ─────────────────────────────────────────────────────────
@@ -292,11 +297,11 @@ socket.on("print:job", async (job) => {
         pagesDone: 0, pagesTotal,
         currentFile: file.originalName, error: null
       })
-      const isPdf   = /\.pdf$/i.test(file.originalName) || (file.mimeType || "").includes("pdf")
+      const isPdf = /\.pdf$/i.test(file.originalName) || (file.mimeType || "").includes("pdf")
       const isImage = /\.(jpe?g|png|gif|webp|bmp)$/i.test(file.originalName)
-      if (isPdf)        processedPath = await printer.normalizePdfToA4(rawPath)
+      if (isPdf) processedPath = await printer.normalizePdfToA4(rawPath)
       else if (isImage) processedPath = await printer.imageToA4Pdf(rawPath)
-      else              processedPath = rawPath
+      else processedPath = rawPath
       if (processedPath && processedPath !== rawPath) tempFiles.push(processedPath)
     } catch (err) {
       log.error(`  Normalization failed: ${err.message}`)
@@ -322,8 +327,8 @@ socket.on("print:job", async (job) => {
         printerSlot,
         printerName: targetPrinter || PRINTER1 || "Printer",
         pagesTotal,
-        filesTotal:  filesOnThisPrinter,
-        filesDone:   fileIndexOnPrinter,
+        filesTotal: filesOnThisPrinter,
+        filesDone: fileIndexOnPrinter,
       })
 
       const finalPath = processedPath || rawPath
@@ -340,7 +345,7 @@ socket.on("print:job", async (job) => {
       // Count sheets used per printer
       const sheets = countSheets(file)
       if (targetPrinter === PRINTER2 && VARIANT === "DX") sheetsP2 += sheets
-      else                                                  sheetsP1 += sheets
+      else sheetsP1 += sheets
 
       results.push({ filename: file.originalName, success: true })
       log.info(`  ✅ Done: ${file.originalName} (${sheets} sheet${sheets !== 1 ? 's' : ''})`)
@@ -368,8 +373,8 @@ socket.on("print:job", async (job) => {
   }
 
   // ── 4. Report result ──────────────────────────────────────────────────────
-  const allOk  = results.every(r => r.success)
-  const anyOk  = results.some(r => r.success)
+  const allOk = results.every(r => r.success)
+  const anyOk = results.some(r => r.success)
   const status = allOk ? "COMPLETED" : anyOk ? "PARTIAL_FAILURE" : "FAILED"
 
   // Build failure reason for display
