@@ -392,6 +392,117 @@ function cleanup(filePaths) {
   }
 }
 
+// ── IPP Printer Status Poll ───────────────────────────────────────────────────
+// Uses ipptool to query live CUPS printer attributes every second.
+// Returns a rich status object for the frontend.
+
+const CUPS_STATE_REASON_MAP = {
+  "none":                    { label: "All Good",           severity: "ok"      },
+  "media-empty":             { label: "Out of Paper",        severity: "error"   },
+  "media-empty-warning":     { label: "Paper Low",           severity: "warning" },
+  "media-needed":            { label: "Load Paper",          severity: "error"   },
+  "media-jam":               { label: "Paper Jam",           severity: "error"   },
+  "marker-supply-empty":     { label: "Ink / Toner Empty",   severity: "error"   },
+  "marker-supply-low":       { label: "Ink / Toner Low",     severity: "warning" },
+  "cover-open":              { label: "Cover Open",          severity: "error"   },
+  "door-open":               { label: "Door Open",           severity: "error"   },
+  "offline-report":          { label: "Printer Offline",     severity: "error"   },
+  "offline":                 { label: "Printer Offline",     severity: "error"   },
+  "stopped":                 { label: "Printer Stopped",     severity: "error"   },
+  "paused":                  { label: "Printer Paused",      severity: "warning" },
+  "connecting-to-device":    { label: "Connecting…",         severity: "warning" },
+  "toner-empty":             { label: "Toner Empty",         severity: "error"   },
+  "toner-low":               { label: "Toner Low",           severity: "warning" },
+}
+
+const IPP_TEST_PATHS = [
+  "/usr/share/cups/ipptool/get-printer-attributes.test",
+  "/usr/share/ipptool/get-printer-attributes.test",
+  "/usr/lib/cups/ipptool/get-printer-attributes.test",
+]
+
+let _ippTestFile = null
+function findIppTestFile() {
+  if (_ippTestFile) return _ippTestFile
+  for (const p of IPP_TEST_PATHS) {
+    if (fs.existsSync(p)) { _ippTestFile = p; return p }
+  }
+  return null
+}
+
+async function pollPrinterIPP(printerName) {
+  const offline = {
+    online: false, state: "stopped",
+    stateReasons: [{ code: "offline-report", label: "Printer Offline", severity: "error" }],
+    inkLevels: [], jobsInQueue: 0
+  }
+
+  const testFile = findIppTestFile()
+  if (!testFile) {
+    log.warn("ipptool test file not found — falling back to lpstat")
+    return pollPrinterLpstat(printerName)
+  }
+
+  const ippUrl = `ipp://localhost/printers/${printerName}`
+
+  return new Promise(resolve => {
+    execFile("ipptool", ["-t", ippUrl, testFile], { timeout: 3000 }, (err, stdout) => {
+      if (err || !stdout || stdout.includes("FAIL")) {
+        resolve(offline)
+        return
+      }
+
+      // printer-state: idle=3, processing=4, stopped=5
+      const stateMatch = stdout.match(/printer-state\s*=\s*(\w+)/)
+      const rawState   = stateMatch ? stateMatch[1] : "unknown"
+      const state = rawState === "idle"       ? "idle"
+                  : rawState === "processing" ? "processing"
+                  : rawState === "stopped"    ? "stopped"
+                  : "unknown"
+
+      // printer-state-reasons (can be comma-separated)
+      const reasonsMatch = stdout.match(/printer-state-reasons\s*=\s*(.+)/)
+      const reasonCodes  = reasonsMatch
+        ? reasonsMatch[1].trim().split(/[,\s]+/).map(r => r.trim()).filter(Boolean)
+        : ["none"]
+      const stateReasons = reasonCodes.map(code => ({
+        code,
+        label:    (CUPS_STATE_REASON_MAP[code] || CUPS_STATE_REASON_MAP["none"]).label,
+        severity: (CUPS_STATE_REASON_MAP[code] || { severity: "ok" }).severity,
+      }))
+
+      // marker-levels: comma-separated integers (ink/toner %)
+      const inkMatch  = stdout.match(/marker-levels\s*=\s*(.+)/)
+      const inkLevels = inkMatch
+        ? inkMatch[1].trim().split(",").map(v => parseInt(v.trim(), 10)).filter(n => !isNaN(n) && n >= 0)
+        : []
+
+      // queued-job-count
+      const jobsMatch  = stdout.match(/queued-job-count\s*=\s*(\d+)/)
+      const jobsInQueue = jobsMatch ? parseInt(jobsMatch[1], 10) : 0
+
+      const hasError   = stateReasons.some(r => r.severity === "error" && r.code !== "none")
+      const online     = state !== "stopped" || !hasError
+
+      resolve({ online, state, stateReasons, inkLevels, jobsInQueue })
+    })
+  })
+}
+
+// Fallback: use lpstat if ipptool is unavailable
+async function pollPrinterLpstat(printerName) {
+  return new Promise(resolve => {
+    execFile("lpstat", ["-p", printerName], { timeout: 3000 }, (err, stdout) => {
+      if (err || !stdout) {
+        resolve({ online: false, state: "stopped", stateReasons: [{ code: "offline-report", label: "Printer Offline", severity: "error" }], inkLevels: [], jobsInQueue: 0 })
+        return
+      }
+      const online = stdout.toLowerCase().includes("enabled")
+      resolve({ online, state: online ? "idle" : "stopped", stateReasons: [{ code: "none", label: "All Good", severity: "ok" }], inkLevels: [], jobsInQueue: 0 })
+    })
+  })
+}
+
 module.exports = {
   getWorkDir,
   normalizePdfToA4,
@@ -400,5 +511,7 @@ module.exports = {
   printFileToNamed,
   waitForCupsJob,
   getCupsJobInfo,
+  pollPrinterIPP,
+  CUPS_STATE_REASON_MAP,
   cleanup
 }
