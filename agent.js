@@ -1,35 +1,34 @@
-// hiiii
-
 /**
  * agent.js — PixelPrint Print Agent
  * ─────────────────────────────────────────────────────────────────────────────
  * Runs as a systemd / PM2 service on each kiosk machine.
  *
- * Config (read from config.json in the same directory):
+ * Config (read from config.json):
  *   {
- *     "kioskId":    "NIT_CALICUT_MILMA",
- *     "backendUrl": "https://printing-pixel-1.onrender.com",
- *     "secret":     "pixelprint-agent-2026",
- *     "printer1":   "HP_Color_LaserJet",   // Color / primary printer (SX & DX)
- *     "printer2":   null                    // B&W printer — null for SX, name for DX
+ *     "kioskId":        "NIT_CALICUT_MILMA",
+ *     "backendUrl":     "https://printing-pixel-1.onrender.com",
+ *     "kioskBackendUrl":"https://kiosk-backend-t1mi.onrender.com",
+ *     "secret":         "pixelprint-agent-2026",
+ *     "printer1":       "EPSON_L6460_Series_USB_3",   // Color / primary (SX & DX)
+ *     "printer2":       "Brother_HL_L5210DN_series_USB" // B&W (DX only; null for SX)
  *   }
+ *
+ * DX kiosks: color files → printer1, B&W files → printer2, run IN PARALLEL.
+ * SX kiosks: all files → printer1, sequential (one printer only).
  */
 
-const fs = require("fs")
+const fs   = require("fs")
 const path = require("path")
 const axios = require("axios")
 const { io } = require("socket.io-client")
 
-const log = require("./logger")
+const log     = require("./logger")
 const printer = require("./printer")
 
 // ── Load config ──────────────────────────────────────────────────────────────
 
-const CONFIG_PATH = process.env.CONFIG_PATH
-  || path.join("/etc/pixelprint/config.json")   // production (Linux)
-
-// Dev fallback: use config.json in the current directory
-const DEV_CONFIG = path.join(__dirname, "config.json")
+const CONFIG_PATH = process.env.CONFIG_PATH || "/etc/pixelprint/config.json"
+const DEV_CONFIG  = path.join(__dirname, "config.json")
 
 let config
 try {
@@ -38,43 +37,35 @@ try {
   log.info(`Loaded config from: ${configFile}`)
 } catch (err) {
   log.error(`Failed to read config: ${err.message}`)
-  log.error(`Please create config.json or /etc/pixelprint/config.json`)
-  log.error(`See config.example.json for format.`)
   process.exit(1)
 }
 
-const KIOSK_ID = config.kioskId
-const BACKEND = (config.backendUrl || "https://printing-pixel-1.onrender.com").replace(/\/$/, "")
-const KIOSK_BACKEND = (config.kioskBackendUrl || "https://kiosk-backend-t1mi.onrender.com").replace(/\/$/, "")
-const SECRET = config.secret || "pixelprint-agent-2026"
-const VERSION = require("./package.json").version
+const KIOSK_ID      = config.kioskId
+const BACKEND       = (config.backendUrl       || "https://printing-pixel-1.onrender.com").replace(/\/$/, "")
+const KIOSK_BACKEND = (config.kioskBackendUrl  || "https://kiosk-backend-t1mi.onrender.com").replace(/\/$/, "")
+const SECRET        = config.secret || "pixelprint-agent-2026"
+const VERSION       = require("./package.json").version
 
-// ── SX / DX routing constants ────────────────────────────────────────────────
-// printer2 being null/absent means SX (single printer). Both colour and B&W
-// go to printer1. When printer2 is set, this is a DX kiosk: colour → printer1,
-// B&W → printer2.
-const PRINTER1 = config.printer1 || null           // colour / primary printer
-const PRINTER2 = config.printer2 || null           // B&W printer (DX only)
-const VARIANT = PRINTER2 ? "DX" : "SX"           // auto-detected from config
+const PRINTER1 = config.printer1 || null   // color / primary
+const PRINTER2 = config.printer2 || null   // B&W (DX only)
+const VARIANT  = PRINTER2 ? "DX" : "SX"
 
 log.info(`PixelPrint Agent v${VERSION} | Kiosk: ${KIOSK_ID} | Backend: ${BACKEND}`)
 log.info(`Variant: ${VARIANT} | Printer1: "${PRINTER1 || 'auto'}" | Printer2: ${PRINTER2 ? `"${PRINTER2}"` : 'N/A (SX)'}`)
 
-// ── Version check (optional auto-update hook) ────────────────────────────────
+// ── Version check ────────────────────────────────────────────────────────────
 async function checkVersion() {
   try {
     const { data } = await axios.get(`${BACKEND}/api/agent/version`, { timeout: 5000 })
     if (data?.version && data.version !== VERSION) {
       log.warn(`Update available: ${VERSION} → ${data.version}. Run: git pull && pm2 restart pixelprint-agent`)
     }
-  } catch (_) {
-    // Version check is non-critical — ignore errors
-  }
+  } catch (_) {}
 }
 
 // ── Socket.IO connection ─────────────────────────────────────────────────────
 
-log.info(`Connecting to backend socket...`)
+log.info(`Connecting to backend socket: ${BACKEND}`)
 
 const socket = io(BACKEND, {
   auth: { kioskId: KIOSK_ID, secret: SECRET },
@@ -85,35 +76,19 @@ const socket = io(BACKEND, {
   timeout: 20000
 })
 
-// ── Connection events ────────────────────────────────────────────────────────
-
 socket.on("connect", () => {
   log.info(`Connected to backend | Socket ID: ${socket.id}`)
-
   socket.emit("kiosk:register", {
-    kioskId: KIOSK_ID,
-    version: VERSION,
-    platform: process.platform,
-    hostname: require("os").hostname()
+    kioskId: KIOSK_ID, version: VERSION,
+    platform: process.platform, hostname: require("os").hostname()
   })
-
   checkVersion()
 })
-
-socket.on("connect_error", (err) => {
-  log.error(`Connection error: ${err.message}`)
-})
-
-socket.on("disconnect", (reason) => {
-  log.warn(`Disconnected: ${reason}`)
-})
-
-socket.on("reconnect", (attempt) => {
-  log.info(`Reconnected after ${attempt} attempt(s)`)
-})
+socket.on("connect_error", (err) => log.error(`Connection error: ${err.message}`))
+socket.on("disconnect",    (r)   => log.warn(`Disconnected: ${r}`))
+socket.on("reconnect",     (n)   => log.info(`Reconnected after ${n} attempt(s)`))
 
 // ── Heartbeat ────────────────────────────────────────────────────────────────
-
 setInterval(() => {
   if (socket.connected) {
     socket.emit("kiosk:heartbeat", {
@@ -124,54 +99,178 @@ setInterval(() => {
   }
 }, 30_000)
 
-// ── Page-tick helper ─────────────────────────────────────────────────────────
-// Emits page-level progress every PAGE_TICK_MS while a CUPS print job runs.
-// Because CUPS doesn't expose real-time page callbacks without kernel hooks,
-// we simulate progress by incrementing pagesDone at a fixed interval.
-// The tick rate is calibrated to reach pagesTotal right around when printing ends.
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-const PAGE_TICK_MS = 2000   // emit every 2 s
+function emitProgress(printJobId, printerSlot, printerName, status, extra = {}) {
+  socket.emit("print:printer_progress", {
+    printJobId, printer: printerSlot, printerName,
+    status, ...extra
+  })
+}
 
+function countSheets(file) {
+  const pageCount = file.pageCount || 1
+  const copies    = file.printOptions?.copies || 1
+  const duplex    = file.printOptions?.duplex === "double"
+  const pages     = pageCount * copies
+  return duplex ? Math.ceil(pages / 2) : pages
+}
+
+// ── Per-printer job runner ───────────────────────────────────────────────────
 /**
- * Start a page-tick interval for one file being printed.
- * Returns a stop function — call it once printing finishes.
+ * Download, normalise, and print all files routed to one printer.
+ * Runs entirely independently — safe to call with Promise.all for DX.
+ *
+ * @param {object} opts
+ * @param {string}  opts.printJobId
+ * @param {Array}   opts.files         — the subset of files for this printer
+ * @param {string}  opts.printerName   — exact CUPS printer name
+ * @param {string}  opts.printerSlot   — "printer1" | "printer2"
+ * @returns {{ sheets: number, results: Array }}
  */
-function startPageTick({ printJobId, printerSlot, printerName, pagesTotal, filesTotal, filesDone }) {
-  if (!pagesTotal || pagesTotal <= 1) return () => { }  // nothing useful to tick
+async function runPrinterGroup({ printJobId, files, printerName, printerSlot }) {
+  const workDir   = printer.getWorkDir()
+  const tempFiles = []
+  const results   = []
+  let   sheets    = 0
 
-  let pagesDone = 0
+  const filesTotal = files.length
 
-  // How many ticks to reach pagesTotal?  We spread them so the last tick
-  // fires just before printing ends.  CUPS averages ~1–2 pages/second
-  // for typical laser printers, so PAGE_TICK_MS × ticks ≈ printing time.
-  const handle = setInterval(() => {
-    pagesDone = Math.min(pagesDone + 1, pagesTotal - 1)  // hold at pagesTotal-1 until done
-    socket.emit("print:printer_progress", {
-      printJobId,
-      printer: printerSlot,
-      printerName: printerName,
-      status: "PRINTING",
-      filesDone,
-      filesTotal,
-      pagesDone,
-      pagesTotal,
-      currentFile: null,
-      error: null,
+  for (let fi = 0; fi < files.length; fi++) {
+    const file          = files[fi]
+    const filesDone     = fi
+    const pagesTotal    = (file.pageCount || 1) * (file.printOptions?.copies || 1)
+
+    log.info(`[${printerSlot}] [${fi + 1}/${filesTotal}] ${file.originalName} → "${printerName}"`)
+
+    // ── DOWNLOADING ────────────────────────────────────────────────────────
+    emitProgress(printJobId, printerSlot, printerName, "DOWNLOADING", {
+      filesDone, filesTotal, pagesDone: 0, pagesTotal,
+      currentFile: file.originalName, error: null
     })
-  }, PAGE_TICK_MS)
 
-  return () => clearInterval(handle)
+    let rawPath = null
+    try {
+      socket.emit("print:progress", { printJobId, status: "DOWNLOADING", fileIndex: fi })
+      const response = await axios({
+        method: "GET", url: file.url,
+        responseType: "arraybuffer", timeout: 120_000
+      })
+      const safeName = file.originalName.replace(/[^a-zA-Z0-9._-]/g, "_")
+      rawPath = path.join(workDir, `${Date.now()}_${safeName}`)
+      fs.writeFileSync(rawPath, Buffer.from(response.data))
+      tempFiles.push(rawPath)
+      log.info(`  [${printerSlot}] Downloaded: ${path.basename(rawPath)}`)
+    } catch (err) {
+      log.error(`  [${printerSlot}] Download failed: ${err.message}`)
+      emitProgress(printJobId, printerSlot, printerName, "FAILED", {
+        filesDone, filesTotal, pagesDone: 0, pagesTotal,
+        currentFile: file.originalName, error: `Download failed: ${err.message}`
+      })
+      results.push({ filename: file.originalName, success: false, error: `Download failed: ${err.message}` })
+      continue
+    }
+
+    // ── PROCESSING (normalize PDF / convert image) ─────────────────────────
+    let processedPath = null
+    try {
+      socket.emit("print:progress", { printJobId, status: "PROCESSING", fileIndex: fi })
+      emitProgress(printJobId, printerSlot, printerName, "PROCESSING", {
+        filesDone, filesTotal, pagesDone: 0, pagesTotal,
+        currentFile: file.originalName, error: null
+      })
+      const isPdf   = /\.pdf$/i.test(file.originalName) || (file.mimeType || "").includes("pdf")
+      const isImage = /\.(jpe?g|png|gif|webp|bmp)$/i.test(file.originalName)
+      if (isPdf)        processedPath = await printer.normalizePdfToA4(rawPath)
+      else if (isImage) processedPath = await printer.imageToA4Pdf(rawPath)
+      else              processedPath = rawPath
+      if (processedPath && processedPath !== rawPath) tempFiles.push(processedPath)
+    } catch (err) {
+      log.error(`  [${printerSlot}] Normalization failed: ${err.message}`)
+      processedPath = rawPath
+    }
+
+    // ── PRINTING ───────────────────────────────────────────────────────────
+    const finalPath = processedPath || rawPath
+    socket.emit("print:progress", { printJobId, status: "PRINTING", fileIndex: fi })
+    emitProgress(printJobId, printerSlot, printerName, "PRINTING", {
+      filesDone, filesTotal, pagesDone: 0, pagesTotal,
+      currentFile: file.originalName, error: null
+    })
+
+    try {
+      const { jobId } = await printer.printFileToNamed(finalPath, printerName, file.printOptions)
+
+      // ── Poll real CUPS status until the job finishes ─────────────────────
+      if (jobId) {
+        await printer.waitForCupsJob(jobId, {
+          timeoutMs:   300_000,
+          intervalMs:  1500,
+          onStatus: ({ state, reason, active }) => {
+            // Map CUPS state → UI status
+            let uiStatus = "PRINTING"
+            let uiError  = null
+
+            if (state === "stopped" || state === "held") {
+              uiStatus = "STOPPED"
+              uiError  = reason || "Printer stopped — check printer panel"
+            } else if (!active) {
+              uiStatus = "COMPLETED"
+            }
+
+            emitProgress(printJobId, printerSlot, printerName, uiStatus, {
+              filesDone, filesTotal,
+              pagesDone: uiStatus === "COMPLETED" ? pagesTotal : null,
+              pagesTotal,
+              currentFile: uiStatus === "COMPLETED" ? null : file.originalName,
+              error: uiError,
+              cupsJobId: jobId,
+              cupsState: state
+            })
+          }
+        })
+      }
+
+      // Count sheets
+      const fileSheets = countSheets(file)
+      sheets += fileSheets
+      results.push({ filename: file.originalName, success: true })
+      log.info(`  [${printerSlot}] ✅ Done: ${file.originalName} (${fileSheets} sheets)`)
+
+      // Emit final COMPLETED for this file
+      const isLastFile = fi + 1 >= filesTotal
+      emitProgress(printJobId, printerSlot, printerName,
+        isLastFile ? "COMPLETED" : "PRINTING",
+        {
+          filesDone: fi + 1, filesTotal,
+          pagesDone: pagesTotal, pagesTotal,
+          currentFile: null, error: null
+        }
+      )
+
+    } catch (err) {
+      log.error(`  [${printerSlot}] Print failed: ${err.message}`)
+      emitProgress(printJobId, printerSlot, printerName, "FAILED", {
+        filesDone, filesTotal, pagesDone: 0, pagesTotal,
+        currentFile: file.originalName, error: err.message
+      })
+      results.push({ filename: file.originalName, success: false, error: err.message })
+    }
+  }
+
+  printer.cleanup(tempFiles)
+  return { sheets, results }
 }
 
 // ── Print job handler ────────────────────────────────────────────────────────
 
-let isProcessing = false  // Prevent concurrent jobs
+let isProcessing = false
 
 socket.on("print:job", async (job) => {
   const { printJobId, files, totalPages } = job
 
   if (isProcessing) {
-    log.warn(`Job ${printJobId} received but agent is busy — will retry via queue`)
+    log.warn(`Job ${printJobId} received but agent is busy — rejecting (queue via backend)`)
     return
   }
 
@@ -182,216 +281,89 @@ socket.on("print:job", async (job) => {
   // Acknowledge receipt
   socket.emit("print:ack", { printJobId, kioskId: KIOSK_ID })
 
-  const workDir = printer.getWorkDir()
-  const results = []
-  const tempFiles = []
-
-  // ── Classify files: color vs B&W ────────────────────────────────────────
+  // ── Classify files: color vs B&W ─────────────────────────────────────────
   const colorFiles = files.filter(f => (f.printOptions?.colorMode || "bw") === "color")
-  const bwFiles = files.filter(f => (f.printOptions?.colorMode || "bw") !== "color")
+  const bwFiles    = files.filter(f => (f.printOptions?.colorMode || "bw") !== "color")
 
-  log.info(`[${VARIANT}] Routing: ${colorFiles.length} color → "${PRINTER1 || 'auto'}" | ${bwFiles.length} B&W → "${VARIANT === "DX" ? (PRINTER2 || PRINTER1 || 'auto') : (PRINTER1 || 'auto')}"`)
+  log.info(`[${VARIANT}] Routing: ${colorFiles.length} color → "${PRINTER1}" | ${bwFiles.length} B&W → "${VARIANT === "DX" ? PRINTER2 : PRINTER1}"`)
 
-  // ── Build routing table ──────────────────────────────────────────────────
-  // SX: all jobs → printer1
-  // DX: color → printer1, B&W → printer2 (fallback to printer1 if unset)
-  const jobQueue = VARIANT === "SX"
-    ? files.map(f => ({ file: f, targetPrinter: PRINTER1 }))
-    : [
-      ...colorFiles.map(f => ({ file: f, targetPrinter: PRINTER1 })),
-      ...bwFiles.map(f => ({ file: f, targetPrinter: PRINTER2 || PRINTER1 }))
-    ]
+  // ── Build printer groups ──────────────────────────────────────────────────
+  let groups = []
 
-  // ── Sheet counting per printer ────────────────────────────────────────────
-  // Duplex: 1 sheet per 2 pages. Single-side: 1 sheet per page.
-  function countSheets(file) {
-    const pageCount = file.pageCount || 1
-    const copies = file.printOptions?.copies || 1
-    const duplex = file.printOptions?.duplex === "double"
-    const pages = pageCount * copies
-    return duplex ? Math.ceil(pages / 2) : pages
+  if (VARIANT === "SX") {
+    // SX: everything goes to printer1 sequentially
+    groups = [{
+      printerSlot: "printer1",
+      printerName: PRINTER1,
+      files:       files
+    }]
+  } else {
+    // DX: color → printer1, B&W → printer2 — run both IN PARALLEL
+    if (colorFiles.length > 0) {
+      groups.push({ printerSlot: "printer1", printerName: PRINTER1, files: colorFiles })
+    }
+    if (bwFiles.length > 0) {
+      groups.push({ printerSlot: "printer2", printerName: PRINTER2 || PRINTER1, files: bwFiles })
+    }
+    // Edge case: all files same color mode — both go to one printer
+    if (groups.length === 0) {
+      groups = [{ printerSlot: "printer1", printerName: PRINTER1, files }]
+    }
   }
 
-  // ── Compute total pages per file (for page-tick) ─────────────────────────
-  function computePagesTotal(file) {
-    const pageCount = file.pageCount || 1
-    const copies = file.printOptions?.copies || 1
-    return pageCount * copies
-  }
-
-  let sheetsP1 = 0   // sheets consumed on printer1
-  let sheetsP2 = 0   // sheets consumed on printer2
-
-  // ── Process each routed job ──────────────────────────────────────────────
-  for (let i = 0; i < jobQueue.length; i++) {
-    const { file, targetPrinter } = jobQueue[i]
-    // Determine printer slot label ("printer1" or "printer2")
-    const printerSlot = (VARIANT === "DX" && targetPrinter === PRINTER2) ? "printer2" : "printer1"
-    const filesOnThisPrinter = jobQueue.filter(j =>
-      (VARIANT === "DX" && j.targetPrinter === PRINTER2) ? printerSlot === "printer2" : printerSlot === "printer1"
-    ).length
-    const fileIndexOnPrinter = jobQueue
-      .slice(0, i)
-      .filter(j => ((VARIANT === "DX" && j.targetPrinter === PRINTER2) ? "printer2" : "printer1") === printerSlot)
-      .length
-
-    const pagesTotal = computePagesTotal(file)
-
-    log.info(`\n[${i + 1}/${jobQueue.length}] ${file.originalName} → "${targetPrinter || 'auto'}" (${printerSlot}) | ${pagesTotal} pages`)
-
-    // ── Emit: starting this file on this printer ─────────────────────────
-    socket.emit("print:printer_progress", {
-      printJobId,
-      printer: printerSlot,
-      printerName: targetPrinter || PRINTER1 || "Printer",
-      status: "DOWNLOADING",
-      filesDone: fileIndexOnPrinter,
-      filesTotal: filesOnThisPrinter,
-      pagesDone: 0,
-      pagesTotal,
-      currentFile: file.originalName,
-      error: null
+  // ── Emit initial QUEUED status for each printer group ────────────────────
+  for (const g of groups) {
+    emitProgress(printJobId, g.printerSlot, g.printerName, "QUEUED", {
+      filesDone: 0, filesTotal: g.files.length,
+      pagesDone: 0, pagesTotal: 0, currentFile: null, error: null
     })
-
-    let rawPath = null
-    let processedPath = null
-
-    // ── 1. Download ─────────────────────────────────────────────────────────
-    try {
-      socket.emit("print:progress", { printJobId, status: "DOWNLOADING", fileIndex: i })
-      log.info(`  Downloading from S3...`)
-      const response = await axios({
-        method: "GET",
-        url: file.url,
-        responseType: "arraybuffer",
-        timeout: 120_000
-      })
-      const safeName = file.originalName.replace(/[^a-zA-Z0-9._-]/g, "_")
-      rawPath = path.join(workDir, `${Date.now()}_${safeName}`)
-      fs.writeFileSync(rawPath, Buffer.from(response.data))
-      tempFiles.push(rawPath)
-      log.info(`  Saved: ${path.basename(rawPath)}`)
-    } catch (err) {
-      log.error(`  Download failed: ${err.message}`)
-      socket.emit("print:printer_progress", {
-        printJobId, printer: printerSlot,
-        printerName: targetPrinter || PRINTER1 || "Printer",
-        status: "FAILED", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
-        pagesDone: 0, pagesTotal,
-        currentFile: file.originalName, error: `Download failed: ${err.message}`
-      })
-      results.push({ filename: file.originalName, success: false, error: `Download failed: ${err.message}` })
-      continue
-    }
-
-    // ── 2. Normalize to A4 ──────────────────────────────────────────────────
-    try {
-      socket.emit("print:progress", { printJobId, status: "PROCESSING", fileIndex: i })
-      socket.emit("print:printer_progress", {
-        printJobId, printer: printerSlot,
-        printerName: targetPrinter || PRINTER1 || "Printer",
-        status: "PROCESSING", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
-        pagesDone: 0, pagesTotal,
-        currentFile: file.originalName, error: null
-      })
-      const isPdf = /\.pdf$/i.test(file.originalName) || (file.mimeType || "").includes("pdf")
-      const isImage = /\.(jpe?g|png|gif|webp|bmp)$/i.test(file.originalName)
-      if (isPdf) processedPath = await printer.normalizePdfToA4(rawPath)
-      else if (isImage) processedPath = await printer.imageToA4Pdf(rawPath)
-      else processedPath = rawPath
-      if (processedPath && processedPath !== rawPath) tempFiles.push(processedPath)
-    } catch (err) {
-      log.error(`  Normalization failed: ${err.message}`)
-      processedPath = rawPath
-    }
-
-    // ── 3. Print to routed printer ───────────────────────────────────────────
-    try {
-      socket.emit("print:progress", { printJobId, status: "PRINTING", fileIndex: i })
-
-      // Emit initial PRINTING event with pagesDone=0
-      socket.emit("print:printer_progress", {
-        printJobId, printer: printerSlot,
-        printerName: targetPrinter || PRINTER1 || "Printer",
-        status: "PRINTING", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
-        pagesDone: 0, pagesTotal,
-        currentFile: file.originalName, error: null
-      })
-
-      // ── Start page-tick while CUPS job runs ──────────────────────────────
-      const stopPageTick = startPageTick({
-        printJobId,
-        printerSlot,
-        printerName: targetPrinter || PRINTER1 || "Printer",
-        pagesTotal,
-        filesTotal: filesOnThisPrinter,
-        filesDone: fileIndexOnPrinter,
-      })
-
-      const finalPath = processedPath || rawPath
-
-      if (targetPrinter) {
-        await printer.printFileToNamed(finalPath, targetPrinter, file.printOptions)
-      } else {
-        await printer.printFile(finalPath, file.printOptions)
-      }
-
-      // ── Stop page-tick, mark full page progress ───────────────────────────
-      stopPageTick()
-
-      // Count sheets used per printer
-      const sheets = countSheets(file)
-      if (targetPrinter === PRINTER2 && VARIANT === "DX") sheetsP2 += sheets
-      else sheetsP1 += sheets
-
-      results.push({ filename: file.originalName, success: true })
-      log.info(`  ✅ Done: ${file.originalName} (${sheets} sheet${sheets !== 1 ? 's' : ''})`)
-
-      // Emit: this file is done on this printer (all pages done)
-      socket.emit("print:printer_progress", {
-        printJobId, printer: printerSlot,
-        printerName: targetPrinter || PRINTER1 || "Printer",
-        status: fileIndexOnPrinter + 1 >= filesOnThisPrinter ? "COMPLETED" : "PRINTING",
-        filesDone: fileIndexOnPrinter + 1, filesTotal: filesOnThisPrinter,
-        pagesDone: pagesTotal, pagesTotal,
-        currentFile: null, error: null
-      })
-    } catch (err) {
-      log.error(`  Print failed: ${err.message}`)
-      socket.emit("print:printer_progress", {
-        printJobId, printer: printerSlot,
-        printerName: targetPrinter || PRINTER1 || "Printer",
-        status: "FAILED", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
-        pagesDone: 0, pagesTotal,
-        currentFile: file.originalName, error: err.message
-      })
-      results.push({ filename: file.originalName, success: false, error: err.message })
-    }
   }
 
-  // ── 4. Report result ──────────────────────────────────────────────────────
-  const allOk = results.every(r => r.success)
-  const anyOk = results.some(r => r.success)
+  // ── Run printer groups (parallel for DX) ─────────────────────────────────
+  let allResults = []
+  let sheetsP1   = 0
+  let sheetsP2   = 0
+
+  try {
+    const groupResults = await Promise.all(
+      groups.map(g => runPrinterGroup({ printJobId, ...g }))
+    )
+
+    for (let gi = 0; gi < groups.length; gi++) {
+      const gr = groupResults[gi]
+      allResults = allResults.concat(gr.results)
+      if (groups[gi].printerSlot === "printer1") sheetsP1 += gr.sheets
+      if (groups[gi].printerSlot === "printer2") sheetsP2 += gr.sheets
+    }
+  } catch (err) {
+    log.error(`Fatal job error: ${err.message}`)
+    allResults.push({ filename: "unknown", success: false, error: err.message })
+  }
+
+  // ── Report overall result ─────────────────────────────────────────────────
+  const allOk = allResults.every(r => r.success)
+  const anyOk = allResults.some(r => r.success)
   const status = allOk ? "COMPLETED" : anyOk ? "PARTIAL_FAILURE" : "FAILED"
 
-  // Build failure reason for display
-  const failedResults = results.filter(r => !r.success)
+  const failedResults = allResults.filter(r => !r.success)
   const failureReason = failedResults.length > 0
     ? failedResults.map(r => `${r.filename}: ${r.error || 'Unknown error'}`).join(" | ")
     : null
 
-  socket.emit("print:result", { printJobId, kioskId: KIOSK_ID, success: allOk, status, results, failureReason })
-  log.info(`\nJob ${printJobId} → ${status} | P1: −${sheetsP1} sheets | P2: −${sheetsP2} sheets`)
-  log.info(`Results: ${results.filter(r => r.success).length}/${results.length} files OK`)
+  socket.emit("print:result", {
+    printJobId, kioskId: KIOSK_ID,
+    success: allOk, status,
+    results: allResults, failureReason
+  })
 
-  // ── 5. Update paper counts on KIOSK backend ───────────────────────────────
-  // Read current counts, subtract used sheets, write back.
-  // Non-fatal: paper tracking failure never blocks printing.
+  log.info(`\nJob ${printJobId} → ${status} | P1: −${sheetsP1} sheets | P2: −${sheetsP2} sheets`)
+  log.info(`Results: ${allResults.filter(r => r.success).length}/${allResults.length} files OK`)
+
+  // ── Update paper counts on KIOSK backend ─────────────────────────────────
   if (sheetsP1 > 0 || sheetsP2 > 0) {
     try {
       const kioskRes = await axios.get(
-        `${KIOSK_BACKEND}/api/kiosk/${KIOSK_ID}`,
-        { timeout: 10_000 }
+        `${KIOSK_BACKEND}/api/kiosk/${KIOSK_ID}`, { timeout: 10_000 }
       )
       const kiosk = kioskRes.data?.kiosk
       if (kiosk) {
@@ -411,114 +383,54 @@ socket.on("print:job", async (job) => {
     }
   }
 
-  // ── 6. Cleanup temp files ─────────────────────────────────────────────────
-  printer.cleanup(tempFiles)
   isProcessing = false
   log.info(`${"─".repeat(60)}\n`)
 })
 
-// ── Remote restart command ──────────────────────────────────────────────────
+// ── Remote restart ───────────────────────────────────────────────────────────
 
 socket.on("agent:restart", () => {
-  log.info("Remote restart command received — calling pm2 restart")
+  log.info("Remote restart command received")
   const { exec } = require("child_process")
   exec("pm2 restart pixelprint-agent", (err) => {
-    if (err) {
-      log.warn(`pm2 restart failed (${err.message}) — falling back to process.exit`)
-      process.exit(0)
-    }
+    if (err) { log.warn(`pm2 restart failed — falling back to process.exit`); process.exit(0) }
   })
 })
 
-// ── OTA self-update command ─────────────────────────────────────────────────
-// Triggered by backend "agent:update" event.
-// Agent pulls latest code from GitHub, then restarts itself.
+// ── OTA self-update ──────────────────────────────────────────────────────────
 
 socket.on("agent:update", async (data) => {
   const targetVersion = data?.version || "latest"
   log.info(`\n${"─".repeat(60)}`)
   log.info(`🔄 OTA Update received — pulling ${targetVersion}`)
-
-  // Notify backend we started the update
   socket.emit("update:started", { kioskId: KIOSK_ID, version: VERSION })
 
   try {
     const { execSync } = require("child_process")
+    execSync("git fetch origin", { cwd: __dirname, timeout: 60_000, encoding: "utf8" })
+    const resetOutput = execSync("git reset --hard origin/main", { cwd: __dirname, timeout: 30_000, encoding: "utf8" }).trim()
+    execSync("npm install --production", { cwd: __dirname, timeout: 120_000, encoding: "utf8" })
 
-    // 1. Fetch latest from remote (never fails due to divergence)
-    log.info("  Running: git fetch origin...")
-    execSync("git fetch origin", {
-      cwd: __dirname,
-      timeout: 60_000,
-      encoding: "utf8"
-    })
+    log.info(`  ✅ Update complete: ${resetOutput}`)
+    socket.emit("update:done", { kioskId: KIOSK_ID, success: true, previousVersion: VERSION, output: resetOutput })
 
-    // 2. Hard reset to origin/main — discards any local changes / divergence
-    log.info("  Running: git reset --hard origin/main...")
-    const resetOutput = execSync("git reset --hard origin/main", {
-      cwd: __dirname,
-      timeout: 30_000,
-      encoding: "utf8"
-    }).trim()
-    log.info(`  git reset: ${resetOutput}`)
-
-    // 3. Install any new dependencies
-    log.info("  Running: npm install --production...")
-    execSync("npm install --production", {
-      cwd: __dirname,
-      timeout: 120_000,
-      encoding: "utf8"
-    })
-
-    log.info(`  ✅ Update complete — restarting agent via PM2`)
-    socket.emit("update:done", {
-      kioskId: KIOSK_ID,
-      success: true,
-      previousVersion: VERSION,
-      output: resetOutput
-    })
-
-    // Use pm2 restart instead of process.exit(0).
-    // process.exit(0) can trigger PM2's crash-backoff (exponential delay before
-    // restart) if the process hasn't been running long enough.  Calling pm2
-    // restart directly bypasses this and brings the agent back immediately.
     setTimeout(() => {
       const { exec } = require("child_process")
       exec("pm2 restart pixelprint-agent", (err) => {
-        if (err) {
-          log.warn(`pm2 restart failed (${err.message}) — falling back to process.exit`)
-          process.exit(0)
-        }
+        if (err) { log.warn(`pm2 restart failed — process.exit`); process.exit(0) }
       })
     }, 1200)
-
   } catch (err) {
     log.error(`  ❌ Update failed: ${err.message}`)
-    socket.emit("update:done", {
-      kioskId: KIOSK_ID,
-      success: false,
-      error: err.message
-    })
+    socket.emit("update:done", { kioskId: KIOSK_ID, success: false, error: err.message })
   }
 })
 
-
 // ── Graceful shutdown ────────────────────────────────────────────────────────
 
-process.on("SIGTERM", () => {
-  log.info("SIGTERM received — shutting down")
-  socket.disconnect()
-  process.exit(0)
-})
-
-process.on("SIGINT", () => {
-  log.info("SIGINT received — shutting down")
-  socket.disconnect()
-  process.exit(0)
-})
-
+process.on("SIGTERM", () => { log.info("SIGTERM — shutting down"); socket.disconnect(); process.exit(0) })
+process.on("SIGINT",  () => { log.info("SIGINT — shutting down");  socket.disconnect(); process.exit(0) })
 process.on("uncaughtException", (err) => {
   log.error(`Uncaught exception: ${err.message}`)
   log.error(err.stack)
-  // Don't exit — let PM2 restart handle critical failures
 })

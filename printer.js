@@ -3,15 +3,13 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * Handles PDF normalization (Ghostscript), image conversion (ImageMagick),
  * and print submission (CUPS lp on Linux / SumatraPDF + pdf-to-printer on Windows).
- *
- * Ported from KIOSK/frontend/src/main/main.js — now runs as a standalone service.
  */
 
-const fs   = require("fs")
-const path = require("path")
-const os   = require("os")
-const { exec } = require("child_process")
-const log  = require("./logger")
+const fs            = require("fs")
+const path          = require("path")
+const os            = require("os")
+const { exec, execFile } = require("child_process")
+const log           = require("./logger")
 
 // ── Working directory ────────────────────────────────────────────────────────
 
@@ -39,10 +37,6 @@ async function findGhostscript() {
 
 // ── PDF normalization ────────────────────────────────────────────────────────
 
-/**
- * Normalize a PDF to A4 using Ghostscript.
- * Returns the output path, or the original path if GS is unavailable.
- */
 async function normalizePdfToA4(inputPath) {
   const gsCmd = await findGhostscript()
   if (!gsCmd) {
@@ -53,23 +47,20 @@ async function normalizePdfToA4(inputPath) {
   const outputPath = inputPath.replace(/\.pdf$/i, "_A4.pdf")
 
   const args = [
-    gsCmd,
-    "-dBATCH",
-    "-dNOPAUSE",
-    "-dQUIET",
+    "-dBATCH", "-dNOPAUSE", "-dQUIET",
     "-sDEVICE=pdfwrite",
     "-sPAPERSIZE=a4",
     "-dFIXEDMEDIA",
     "-dPDFFitPage",
     "-dAutoRotatePages=/PageByPage",
-    `-sOutputFile="${outputPath}"`,
-    `"${inputPath}"`
-  ].join(" ")
+    `-sOutputFile=${outputPath}`,
+    inputPath
+  ]
 
   log.info(`Normalizing PDF → A4: ${path.basename(inputPath)}`)
 
   return new Promise((resolve) => {
-    exec(args, (err, _stdout, stderr) => {
+    execFile(gsCmd, args, (err, _stdout, stderr) => {
       if (err || !fs.existsSync(outputPath)) {
         log.warn(`Ghostscript failed: ${stderr || err?.message}. Using original.`)
         resolve(inputPath)
@@ -83,26 +74,13 @@ async function normalizePdfToA4(inputPath) {
 
 // ── Image → A4 PDF conversion ────────────────────────────────────────────────
 
-/**
- * Convert an image (JPG/PNG/etc) to A4 PDF using ImageMagick.
- * Falls back to original path if ImageMagick is not installed.
- */
 async function imageToA4Pdf(inputPath) {
   const outputPath = inputPath + "_A4.pdf"
-
-  const args = [
-    "convert",
-    "-page", "A4",
-    "-gravity", "Center",
-    "-background", "white",
-    `"${inputPath}"`,
-    `"${outputPath}"`
-  ].join(" ")
 
   log.info(`Converting image → A4 PDF: ${path.basename(inputPath)}`)
 
   return new Promise((resolve) => {
-    exec(args, (err) => {
+    execFile("convert", ["-page", "A4", "-gravity", "Center", "-background", "white", inputPath, outputPath], (err) => {
       if (err || !fs.existsSync(outputPath)) {
         log.warn(`ImageMagick unavailable — printing image directly. Install: sudo apt install imagemagick`)
         resolve(inputPath)
@@ -118,12 +96,128 @@ async function imageToA4Pdf(inputPath) {
 
 function getCupsPrinter() {
   return new Promise(resolve => {
-    exec("lpstat -a 2>/dev/null | awk '{print $1}' | head -1", (err, stdout) => {
-      const name = (stdout || "").trim()
+    execFile("lpstat", ["-a"], (err, stdout) => {
+      const lines = (stdout || "").trim().split("\n").filter(Boolean)
+      const name  = lines.length > 0 ? lines[0].split(" ")[0].trim() : null
       if (!name) log.warn("lpstat found no printers in CUPS.")
       resolve(name || null)
     })
   })
+}
+
+// ── Page range helper ────────────────────────────────────────────────────────
+
+function buildPageRangeArgs(pageRange) {
+  if (!pageRange || pageRange === "all" || pageRange.trim() === "") return []
+  return ["-o", `page-ranges=${pageRange.trim()}`]
+}
+
+// ── CUPS job state parser ────────────────────────────────────────────────────
+/**
+ * Poll the state of a specific CUPS job by ID.
+ * Returns { state, reason } where state is one of:
+ *   "pending" | "processing" | "stopped" | "held" | "completed" | "unknown"
+ * and reason is the human-readable CUPS reason string (e.g. "media-empty").
+ */
+async function pollCupsJobState(jobId) {
+  if (!jobId) return { state: "unknown", reason: null }
+
+  return new Promise(resolve => {
+    // lpstat -o lists all active jobs; if the job ID appears, it's still running
+    execFile("lpstat", ["-o"], (_err, stdout) => {
+      const lines = (stdout || "").split("\n")
+      const jobLine = lines.find(l => l.includes(jobId))
+
+      if (!jobLine) {
+        // Job no longer in active queue — it's done (completed or cancelled)
+        resolve({ state: "completed", reason: null })
+        return
+      }
+
+      // Parse the status column from lpstat -o output:
+      // Format: "PRINTER-42   user  size  date  time  title"
+      // State is embedded in the job attributes via lpstat -l
+      resolve({ state: "processing", reason: null })
+    })
+  })
+}
+
+/**
+ * Extended CUPS job info from `lpstat -l -j <jobId>` output.
+ * Parses Job-state-reasons to detect error conditions.
+ */
+async function getCupsJobInfo(jobId) {
+  if (!jobId) return { state: "unknown", reason: null, active: false }
+
+  return new Promise(resolve => {
+    // First check if it's still in the queue at all
+    execFile("lpstat", ["-o"], (_err, stdout) => {
+      const active = (stdout || "").split("\n").some(l => {
+        const parts = l.trim().split(/\s+/)
+        return parts[0] === jobId
+      })
+
+      if (!active) {
+        resolve({ state: "completed", reason: null, active: false })
+        return
+      }
+
+      // Job is active — get detailed state from lpstat -l
+      execFile("lpstat", ["-l", "-o"], (_e2, out2) => {
+        const raw = (out2 || "").toLowerCase()
+        let reason = null
+        let state  = "processing"
+
+        // Detect common CUPS error reasons
+        if (raw.includes("media-empty") || raw.includes("media-needed") || raw.includes("tray-missing"))
+          reason = "Paper Out — Please refill the tray"
+        else if (raw.includes("toner-empty") || raw.includes("marker-supply-empty"))
+          reason = "Toner/Ink Empty"
+        else if (raw.includes("cover-open") || raw.includes("door-open"))
+          reason = "Printer cover/door is open"
+        else if (raw.includes("offline") || raw.includes("connecting-to-device"))
+          reason = "Printer offline or not responding"
+        else if (raw.includes("jammed") || raw.includes("paper-jam"))
+          reason = "Paper jam — please clear the printer"
+        else if (raw.includes("stopped") || raw.includes("paused"))
+          reason = "Printer stopped — check printer panel"
+
+        if (reason) state = "stopped"
+
+        resolve({ state, reason, active: true })
+      })
+    })
+  })
+}
+
+// ── CUPS job completion waiter with real status polling ──────────────────────
+/**
+ * Wait for a CUPS job to finish, polling every `intervalMs`.
+ * Calls `onStatus({ state, reason })` on each poll for live reporting.
+ * Returns when the job disappears from the active queue (done/cancelled/failed).
+ */
+async function waitForCupsJob(jobId, { timeoutMs = 300_000, intervalMs = 1500, onStatus } = {}) {
+  if (!jobId) return { state: "completed", reason: null }
+
+  log.info(`  Polling CUPS job: ${jobId}`)
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    const info = await getCupsJobInfo(jobId)
+
+    // Report status to caller for live Socket.IO emission
+    if (onStatus) onStatus(info)
+
+    if (!info.active) {
+      log.info(`  CUPS job ${jobId} finished (${info.state}) ✔`)
+      return info
+    }
+
+    await new Promise(r => setTimeout(r, intervalMs))
+  }
+
+  log.warn(`  CUPS job ${jobId} still active after ${timeoutMs / 1000}s — proceeding anyway`)
+  return { state: "timeout", reason: "Print job timed out", active: false }
 }
 
 // ── SumatraPDF print (Windows) ───────────────────────────────────────────────
@@ -151,59 +245,16 @@ function trySumatraPrint(filePath, printerName, copies) {
   })
 }
 
-// ── Page range helper ────────────────────────────────────────────────────────
+// ── Main print function (auto-detect printer) ────────────────────────────────
 
-function buildLpPageRange(pageRange) {
-  if (!pageRange || pageRange === "all" || pageRange.trim() === "") return ""
-  return `-o page-ranges=${pageRange.trim()}`
-}
-
-// ── CUPS job completion poller ─────────────────────────────────────────────────────
-// lp submits a job to CUPS and returns IMMEDIATELY (the job is queued).
-// The printer may still be physically printing for minutes afterward.
-// This helper polls `lpstat` every 2 s until the job ID disappears from
-// the active queue, which means the printer has finished (or the job was
-// cancelled / errored).  We must await this before marking a job COMPLETED.
-
-async function waitForCupsJob(jobId, timeoutMs = 300_000) {
-  if (!jobId) return
-  log.info(`  Waiting for CUPS job: ${jobId}`)
-  const deadline = Date.now() + timeoutMs
-
-  while (Date.now() < deadline) {
-    const stillActive = await new Promise(resolve => {
-      exec(`lpstat -l -j ${jobId} 2>/dev/null`, (_err, stdout) => {
-        // lpstat returns output while the job is in the queue.
-        // When it returns nothing, the job is done.
-        resolve(!!(stdout && stdout.trim()))
-      })
-    })
-
-    if (!stillActive) {
-      log.info(`  CUPS job ${jobId} finished ✔`)
-      return
-    }
-
-    await new Promise(r => setTimeout(r, 2000))
-  }
-
-  log.warn(`  CUPS job ${jobId} still active after ${timeoutMs / 1000}s — proceeding anyway`)
-}
-
-// ── Main print function ──────────────────────────────────────────────────────
-
-/**
- * Print a file with the given options.
- * Handles both Linux (CUPS) and Windows (SumatraPDF / pdf-to-printer).
- */
 async function printFile(filePath, printOptions) {
-  const opts      = printOptions || {}
-  const copies    = Math.max(1, parseInt(opts.copies) || 1)
-  const colorBW   = opts.colorMode === "bw"
-  const duplex    = opts.duplex === "double"
-  const pageRange = buildLpPageRange(opts.pageRange)
+  const opts    = printOptions || {}
+  const copies  = Math.max(1, parseInt(opts.copies) || 1)
+  const isBW    = opts.colorMode !== "color"
+  const duplex  = opts.duplex === "double"
+  const prArgs  = buildPageRangeArgs(opts.pageRange)
 
-  log.info(`Printing: ${path.basename(filePath)} | Copies:${copies} | BW:${colorBW} | Duplex:${duplex} | Pages:${opts.pageRange || "all"}`)
+  log.info(`Printing: ${path.basename(filePath)} | Copies:${copies} | BW:${isBW} | Duplex:${duplex}`)
 
   // ── Windows ──────────────────────────────────────────────────────────────
   if (process.platform === "win32") {
@@ -230,18 +281,18 @@ async function printFile(filePath, printOptions) {
     if (validPrinters.length === 0) {
       log.warn("No physical printer detected — simulating.")
       await new Promise(r => setTimeout(r, 1500))
-      return
+      return { jobId: null }
     }
 
     const printerName = validPrinters[0].deviceId || validPrinters[0].name
     log.info(`Using printer: ${printerName}`)
 
     const sumatraOk = await trySumatraPrint(filePath, printerName, copies)
-    if (sumatraOk) return
+    if (sumatraOk) return { jobId: null }
 
     await pdfToPrinter.print(filePath, { printer: printerName, copies })
     log.info(`Print submitted (pdf-to-printer): ${path.basename(filePath)}`)
-    return
+    return { jobId: null }
   }
 
   // ── Linux / macOS — CUPS lp ───────────────────────────────────────────────
@@ -250,53 +301,25 @@ async function printFile(filePath, printOptions) {
     throw new Error("No CUPS printer found. Add a printer via: sudo system-config-printer")
   }
 
-  log.info(`Using CUPS printer: ${printerName}`)
-
-  const lpArgs = [
-    "lp",
-    `-d "${printerName}"`,
-    `-n ${copies}`,
-    "-o media=A4",
-    "-o fit-to-page",
-    duplex ? "-o sides=two-sided-long-edge" : "-o sides=one-sided",
-    colorBW ? "-o ColorModel=Gray" : "",
-    pageRange,
-    `"${filePath}"`
-  ].filter(Boolean).join(" ")
-
-  log.info(`lp command: ${lpArgs}`)
-
-  return new Promise((resolve, reject) => {
-    exec(lpArgs, (error, stdout, stderr) => {
-      if (error) {
-        log.error(`lp error: ${error.message}`)
-        reject(new Error(`Print failed: ${error.message}`))
-        return
-      }
-      log.info(`Print submitted: ${path.basename(filePath)} | ${stdout.trim()}`)
-      resolve(stdout)
-    })
-  })
+  return printFileToNamed(filePath, printerName, printOptions)
 }
 
 
 // ── Print to explicitly-named printer (SX/DX routing) ────────────────────────
 
 /**
- * Print a file to a SPECIFIC named printer.
- * Used by the SX/DX router in agent.js — bypasses auto-detection.
- * @param {string} filePath     - Path to the file to print
- * @param {string} printerName  - Exact OS printer name from config.json
- * @param {object} printOptions - { copies, colorMode, duplex, pageRange }
+ * Print a file to a SPECIFIC named CUPS printer.
+ * Returns { jobId } — the CUPS job ID string (e.g. "EPSON_L6460_Series_USB_3-42")
+ * The caller is responsible for waiting/polling using waitForCupsJob().
  */
 async function printFileToNamed(filePath, printerName, printOptions) {
-  const opts      = printOptions || {}
-  const copies    = Math.max(1, parseInt(opts.copies) || 1)
-  const colorBW   = opts.colorMode !== "color"
-  const duplex    = opts.duplex === "double"
-  const pageRange = buildLpPageRange(opts.pageRange)
+  const opts    = printOptions || {}
+  const copies  = Math.max(1, parseInt(opts.copies) || 1)
+  const isBW    = opts.colorMode !== "color"
+  const duplex  = opts.duplex === "double"
+  const prArgs  = buildPageRangeArgs(opts.pageRange)
 
-  log.info(`Routing to printer: "${printerName}" | Copies:${copies} | BW:${colorBW} | Duplex:${duplex}`)
+  log.info(`Routing to printer: "${printerName}" | Copies:${copies} | BW:${isBW} | Duplex:${duplex}`)
 
   // ── Windows ──────────────────────────────────────────────────────────────
   if (process.platform === "win32") {
@@ -306,16 +329,15 @@ async function printFileToNamed(filePath, printerName, printOptions) {
     }
 
     const sumatraOk = await trySumatraPrint(filePath, printerName, copies)
-    if (sumatraOk) return
+    if (sumatraOk) return { jobId: null }
 
     await pdfToPrinter.print(filePath, { printer: printerName, copies })
     log.info(`Print submitted (pdf-to-printer) → "${printerName}": ${path.basename(filePath)}`)
-    return
+    return { jobId: null }
   }
 
-  // ── Linux / macOS — CUPS lp ───────────────────────────────────────────
-  const { execFile } = require("child_process")
-
+  // ── Linux / macOS — CUPS lp via execFile ────────────────────────────────
+  // Build argument array — NO shell quoting needed with execFile
   const lpArgs = [
     "-d", printerName,
     "-n", String(copies),
@@ -324,40 +346,40 @@ async function printFileToNamed(filePath, printerName, printOptions) {
     "-o", duplex ? "sides=two-sided-long-edge" : "sides=one-sided",
   ]
 
-  if (pageRange) {
-    const pr = pageRange.replace(/^-o /, "")
-    if (pr) lpArgs.push("-o", pr)
-  }
+  // Grayscale: use print-color-mode which is supported by IPP/CUPS 2.x
+  if (isBW) lpArgs.push("-o", "print-color-mode=monochrome")
 
+  // Page range
+  lpArgs.push(...prArgs)
+
+  // File MUST be the last argument
   lpArgs.push(filePath)
 
-  log.info(`lp command (named): lp ${lpArgs.join(" ")}`)
+  log.info(`lp ${lpArgs.join(" ")}`)
 
   return new Promise((resolve, reject) => {
-    execFile("lp", lpArgs, async (error, stdout, stderr) => {
+    execFile("lp", lpArgs, (error, stdout, stderr) => {
       if (error) {
-        log.error(`lp error: ${error.message}`)
-        if (stderr) log.error(`lp stderr: ${stderr}`)
-        reject(new Error(`Print failed: ${error.message}`))
+        const detail = stderr ? stderr.trim() : error.message
+        log.error(`lp error for "${printerName}": ${detail}`)
+        reject(new Error(`Print failed on "${printerName}": ${detail}`))
         return
       }
 
-      log.info(`Print submitted → "${printerName}": ${path.basename(filePath)} | ${stdout.trim()}`)
+      const out = (stdout || "").trim()
+      log.info(`Submitted → "${printerName}": ${path.basename(filePath)} | ${out}`)
 
       // Extract CUPS job ID: "request id is PRINTER_NAME-42 (1 file(s))"
-      const jobId = (stdout.match(/request id is (\S+)/) || [])[1]
+      const jobId = (out.match(/request id is (\S+)/) || [])[1] || null
+      log.info(`  CUPS job ID: ${jobId || "(unknown)"}`)
 
-      // Wait for CUPS to actually finish printing (lp is asynchronous)
-      await waitForCupsJob(jobId)
-
-      resolve(stdout)
+      resolve({ jobId })
     })
   })
 }
 
 
 // ── Safe file cleanup ────────────────────────────────────────────────────────
-
 
 function cleanup(filePaths) {
   for (const f of filePaths) {
@@ -376,7 +398,7 @@ module.exports = {
   imageToA4Pdf,
   printFile,
   printFileToNamed,
+  waitForCupsJob,
+  getCupsJobInfo,
   cleanup
 }
-
-
