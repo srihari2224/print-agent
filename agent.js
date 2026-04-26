@@ -177,7 +177,29 @@ socket.on("print:job", async (job) => {
   // ── Process each routed job ──────────────────────────────────────────────
   for (let i = 0; i < jobQueue.length; i++) {
     const { file, targetPrinter } = jobQueue[i]
-    log.info(`\n[${i + 1}/${jobQueue.length}] ${file.originalName} → "${targetPrinter || 'auto'}"`)
+    // Determine printer slot label ("printer1" or "printer2")
+    const printerSlot = (VARIANT === "DX" && targetPrinter === PRINTER2) ? "printer2" : "printer1"
+    const filesOnThisPrinter = jobQueue.filter(j =>
+      (VARIANT === "DX" && j.targetPrinter === PRINTER2) ? printerSlot === "printer2" : printerSlot === "printer1"
+    ).length
+    const fileIndexOnPrinter = jobQueue
+      .slice(0, i)
+      .filter(j => ((VARIANT === "DX" && j.targetPrinter === PRINTER2) ? "printer2" : "printer1") === printerSlot)
+      .length
+
+    log.info(`\n[${i + 1}/${jobQueue.length}] ${file.originalName} → "${targetPrinter || 'auto'}" (${printerSlot})`)
+
+    // ── Emit: starting this file on this printer ─────────────────────────
+    socket.emit("print:printer_progress", {
+      printJobId,
+      printer:     printerSlot,
+      printerName: targetPrinter || PRINTER1 || "Printer",
+      status:      "DOWNLOADING",
+      filesDone:   fileIndexOnPrinter,
+      filesTotal:  filesOnThisPrinter,
+      currentFile: file.originalName,
+      error:       null
+    })
 
     let rawPath       = null
     let processedPath = null
@@ -199,6 +221,12 @@ socket.on("print:job", async (job) => {
       log.info(`  Saved: ${path.basename(rawPath)}`)
     } catch (err) {
       log.error(`  Download failed: ${err.message}`)
+      socket.emit("print:printer_progress", {
+        printJobId, printer: printerSlot,
+        printerName: targetPrinter || PRINTER1 || "Printer",
+        status: "FAILED", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
+        currentFile: file.originalName, error: `Download failed: ${err.message}`
+      })
       results.push({ filename: file.originalName, success: false, error: `Download failed: ${err.message}` })
       continue
     }
@@ -206,6 +234,12 @@ socket.on("print:job", async (job) => {
     // ── 2. Normalize to A4 ──────────────────────────────────────────────────
     try {
       socket.emit("print:progress", { printJobId, status: "PROCESSING", fileIndex: i })
+      socket.emit("print:printer_progress", {
+        printJobId, printer: printerSlot,
+        printerName: targetPrinter || PRINTER1 || "Printer",
+        status: "PROCESSING", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
+        currentFile: file.originalName, error: null
+      })
       const isPdf   = /\.pdf$/i.test(file.originalName) || (file.mimeType || "").includes("pdf")
       const isImage = /\.(jpe?g|png|gif|webp|bmp)$/i.test(file.originalName)
       if (isPdf)        processedPath = await printer.normalizePdfToA4(rawPath)
@@ -220,6 +254,12 @@ socket.on("print:job", async (job) => {
     // ── 3. Print to routed printer ───────────────────────────────────────────
     try {
       socket.emit("print:progress", { printJobId, status: "PRINTING", fileIndex: i })
+      socket.emit("print:printer_progress", {
+        printJobId, printer: printerSlot,
+        printerName: targetPrinter || PRINTER1 || "Printer",
+        status: "PRINTING", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
+        currentFile: file.originalName, error: null
+      })
       const finalPath = processedPath || rawPath
 
       if (targetPrinter) {
@@ -235,8 +275,23 @@ socket.on("print:job", async (job) => {
 
       results.push({ filename: file.originalName, success: true })
       log.info(`  ✅ Done: ${file.originalName} (${sheets} sheet${sheets !== 1 ? 's' : ''})`)
+
+      // Emit: this file is done on this printer
+      socket.emit("print:printer_progress", {
+        printJobId, printer: printerSlot,
+        printerName: targetPrinter || PRINTER1 || "Printer",
+        status: fileIndexOnPrinter + 1 >= filesOnThisPrinter ? "COMPLETED" : "PRINTING",
+        filesDone: fileIndexOnPrinter + 1, filesTotal: filesOnThisPrinter,
+        currentFile: null, error: null
+      })
     } catch (err) {
       log.error(`  Print failed: ${err.message}`)
+      socket.emit("print:printer_progress", {
+        printJobId, printer: printerSlot,
+        printerName: targetPrinter || PRINTER1 || "Printer",
+        status: "FAILED", filesDone: fileIndexOnPrinter, filesTotal: filesOnThisPrinter,
+        currentFile: file.originalName, error: err.message
+      })
       results.push({ filename: file.originalName, success: false, error: err.message })
     }
   }
@@ -246,7 +301,13 @@ socket.on("print:job", async (job) => {
   const anyOk  = results.some(r => r.success)
   const status = allOk ? "COMPLETED" : anyOk ? "PARTIAL_FAILURE" : "FAILED"
 
-  socket.emit("print:result", { printJobId, kioskId: KIOSK_ID, success: allOk, status, results })
+  // Build failure reason for display
+  const failedResults = results.filter(r => !r.success)
+  const failureReason = failedResults.length > 0
+    ? failedResults.map(r => `${r.filename}: ${r.error || 'Unknown error'}`).join(" | ")
+    : null
+
+  socket.emit("print:result", { printJobId, kioskId: KIOSK_ID, success: allOk, status, results, failureReason })
   log.info(`\nJob ${printJobId} → ${status} | P1: −${sheetsP1} sheets | P2: −${sheetsP2} sheets`)
   log.info(`Results: ${results.filter(r => r.success).length}/${results.length} files OK`)
 
