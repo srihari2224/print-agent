@@ -1,7 +1,4 @@
-hi
-
-
-
+hiiii
 
 /**
  * agent.js — PixelPrint Print Agent
@@ -423,8 +420,14 @@ socket.on("print:job", async (job) => {
 // ── Remote restart command ──────────────────────────────────────────────────
 
 socket.on("agent:restart", () => {
-  log.info("Remote restart command received — restarting via PM2")
-  process.exit(0)   // PM2 restarts automatically
+  log.info("Remote restart command received — calling pm2 restart")
+  const { exec } = require("child_process")
+  exec("pm2 restart pixelprint-agent", (err) => {
+    if (err) {
+      log.warn(`pm2 restart failed (${err.message}) — falling back to process.exit`)
+      process.exit(0)
+    }
+  })
 })
 
 // ── OTA self-update command ─────────────────────────────────────────────────
@@ -467,7 +470,7 @@ socket.on("agent:update", async (data) => {
       encoding: "utf8"
     })
 
-    log.info(`  ✅ Update complete — restarting agent`)
+    log.info(`  ✅ Update complete — restarting agent via PM2`)
     socket.emit("update:done", {
       kioskId: KIOSK_ID,
       success: true,
@@ -475,8 +478,19 @@ socket.on("agent:update", async (data) => {
       output: resetOutput
     })
 
-    // Brief delay so the socket message goes through before exit
-    setTimeout(() => process.exit(0), 1000)
+    // Use pm2 restart instead of process.exit(0).
+    // process.exit(0) can trigger PM2's crash-backoff (exponential delay before
+    // restart) if the process hasn't been running long enough.  Calling pm2
+    // restart directly bypasses this and brings the agent back immediately.
+    setTimeout(() => {
+      const { exec } = require("child_process")
+      exec("pm2 restart pixelprint-agent", (err) => {
+        if (err) {
+          log.warn(`pm2 restart failed (${err.message}) — falling back to process.exit`)
+          process.exit(0)
+        }
+      })
+    }, 1200)
 
   } catch (err) {
     log.error(`  ❌ Update failed: ${err.message}`)
