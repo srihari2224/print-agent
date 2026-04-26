@@ -145,17 +145,22 @@ async function runPrinterGroup({ printJobId, files, printerName, printerSlot }) 
 
       if (jobId) {
         await printer.waitForCupsJob(jobId, {
-          timeoutMs:  300_000,
-          intervalMs: 1000,
-          onStatus: ({ state, reason, active }) => {
+          timeoutMs:   300_000,
+          intervalMs:  1000,
+          printerName: printerName,
+          onStatus: ({ state, reason, code, active }) => {
             let uiStatus = "PRINTING"
             let uiError  = null
-            if (state === "stopped" || state === "held") { uiStatus = "STOPPED"; uiError = reason }
-            else if (!active) uiStatus = "COMPLETED"
+            if (state === "stopped" || state === "held") {
+              uiStatus = "ERROR"
+              uiError  = reason || "Printer error — check printer panel"
+            } else if (!active) {
+              uiStatus = "COMPLETED"
+            }
             emitPP(printJobId, printerSlot, printerName, uiStatus, {
               filesDone: i, filesTotal, pagesTotal,
               currentFile: uiStatus === "COMPLETED" ? null : file.originalName,
-              error: uiError, cupsJobId: jobId, cupsState: state
+              error: uiError, errorCode: code || null, cupsJobId: jobId, cupsState: state
             })
           }
         })

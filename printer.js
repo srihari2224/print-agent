@@ -152,9 +152,12 @@ async function getCupsJobInfo(jobId) {
   return new Promise(resolve => {
     // First check if it's still in the queue at all
     execFile("lpstat", ["-o"], (_err, stdout) => {
+      // lpstat -o format: "PRINTERNAME-JOBNUMBER  user  size  date  time"
+      // jobId may be full "PRINTER-42" or just "42" — handle both
       const active = (stdout || "").split("\n").some(l => {
         const parts = l.trim().split(/\s+/)
-        return parts[0] === jobId
+        const col0  = parts[0] || ""
+        return col0 === String(jobId) || col0.endsWith(`-${jobId}`)
       })
 
       if (!active) {
@@ -196,16 +199,32 @@ async function getCupsJobInfo(jobId) {
  * Calls `onStatus({ state, reason })` on each poll for live reporting.
  * Returns when the job disappears from the active queue (done/cancelled/failed).
  */
-async function waitForCupsJob(jobId, { timeoutMs = 300_000, intervalMs = 1500, onStatus } = {}) {
+async function waitForCupsJob(jobId, { timeoutMs = 300_000, intervalMs = 1000, onStatus, printerName } = {}) {
   if (!jobId) return { state: "completed", reason: null }
 
-  log.info(`  Polling CUPS job: ${jobId}`)
+  log.info(`  Polling CUPS job: ${jobId} on printer: ${printerName || "unknown"}`)
   const deadline = Date.now() + timeoutMs
 
   while (Date.now() < deadline) {
-    const info = await getCupsJobInfo(jobId)
+    // Poll both job state AND printer IPP state simultaneously
+    const [info, pStatus] = await Promise.all([
+      getCupsJobInfo(jobId),
+      printerName ? pollPrinterIPP(printerName) : Promise.resolve(null)
+    ])
 
-    // Report status to caller for live Socket.IO emission
+    // Hardware errors ALWAYS win over job state
+    if (pStatus) {
+      const hardwareErrors = pStatus.stateReasons.filter(r => r.severity === "error" && r.code !== "none")
+      if (hardwareErrors.length > 0) {
+        const worst = hardwareErrors[0]
+        info.state  = "stopped"
+        info.reason = worst.label
+        info.code   = worst.code
+        info.active = true   // job is waiting, blocked by hardware
+        log.warn(`  Printer error detected: ${worst.code} — ${worst.label}`)
+      }
+    }
+
     if (onStatus) onStatus(info)
 
     if (!info.active) {
@@ -216,7 +235,7 @@ async function waitForCupsJob(jobId, { timeoutMs = 300_000, intervalMs = 1500, o
     await new Promise(r => setTimeout(r, intervalMs))
   }
 
-  log.warn(`  CUPS job ${jobId} still active after ${timeoutMs / 1000}s — proceeding anyway`)
+  log.warn(`  CUPS job ${jobId} timed out after ${timeoutMs / 1000}s`)
   return { state: "timeout", reason: "Print job timed out", active: false }
 }
 
@@ -397,22 +416,32 @@ function cleanup(filePaths) {
 // Returns a rich status object for the frontend.
 
 const CUPS_STATE_REASON_MAP = {
-  "none":                    { label: "All Good",           severity: "ok"      },
-  "media-empty":             { label: "Out of Paper",        severity: "error"   },
-  "media-empty-warning":     { label: "Paper Low",           severity: "warning" },
-  "media-needed":            { label: "Load Paper",          severity: "error"   },
-  "media-jam":               { label: "Paper Jam",           severity: "error"   },
-  "marker-supply-empty":     { label: "Ink / Toner Empty",   severity: "error"   },
-  "marker-supply-low":       { label: "Ink / Toner Low",     severity: "warning" },
-  "cover-open":              { label: "Cover Open",          severity: "error"   },
-  "door-open":               { label: "Door Open",           severity: "error"   },
-  "offline-report":          { label: "Printer Offline",     severity: "error"   },
-  "offline":                 { label: "Printer Offline",     severity: "error"   },
-  "stopped":                 { label: "Printer Stopped",     severity: "error"   },
-  "paused":                  { label: "Printer Paused",      severity: "warning" },
-  "connecting-to-device":    { label: "Connecting…",         severity: "warning" },
-  "toner-empty":             { label: "Toner Empty",         severity: "error"   },
-  "toner-low":               { label: "Toner Low",           severity: "warning" },
+  // Paper
+  "none":                    { label: "All Good",              severity: "ok"      },
+  "media-empty":             { label: "Out of Paper",           severity: "error"   },
+  "media-empty-warning":     { label: "Paper Low",              severity: "warning" },
+  "media-needed":            { label: "Load Paper",             severity: "error"   },
+  "media-jam":               { label: "Paper Jam",              severity: "error"   },
+  "media-low":               { label: "Paper Running Low",      severity: "warning" },
+  "input-tray-missing":      { label: "Paper Tray Missing",     severity: "error"   },
+  "output-tray-missing":     { label: "Output Tray Missing",    severity: "error"   },
+  // Ink / Toner
+  "marker-supply-empty":     { label: "Ink / Toner Empty",      severity: "error"   },
+  "marker-supply-low":       { label: "Ink / Toner Low",        severity: "warning" },
+  "marker-waste-full":       { label: "Waste Ink Box Full",     severity: "error"   },
+  "toner-empty":             { label: "Toner Empty",            severity: "error"   },
+  "toner-low":               { label: "Toner Low",              severity: "warning" },
+  // Hardware
+  "cover-open":              { label: "Cover Open",             severity: "error"   },
+  "door-open":               { label: "Door Open",              severity: "error"   },
+  // Connectivity
+  "offline-report":          { label: "Printer Offline",        severity: "error"   },
+  "offline":                 { label: "Printer Offline",        severity: "error"   },
+  "connecting-to-device":    { label: "Connecting…",            severity: "warning" },
+  // State
+  "stopped":                 { label: "Printer Stopped",        severity: "error"   },
+  "paused":                  { label: "Printer Paused",         severity: "warning" },
+  "shutdown":                { label: "Printer Off",            severity: "error"   },
 }
 
 const IPP_TEST_PATHS = [
@@ -452,18 +481,19 @@ async function pollPrinterIPP(printerName) {
         return
       }
 
-      // printer-state: idle=3, processing=4, stopped=5
-      const stateMatch = stdout.match(/printer-state\s*=\s*(\w+)/)
-      const rawState   = stateMatch ? stateMatch[1] : "unknown"
-      const state = rawState === "idle"       ? "idle"
-                  : rawState === "processing" ? "processing"
-                  : rawState === "stopped"    ? "stopped"
+      // printer-state: CUPS returns integers OR strings
+      // 3 = idle, 4 = processing, 5 = stopped
+      const stateMatch = stdout.match(/printer-state\s*[=(]\s*(\w+)/)
+      const rawState   = stateMatch ? stateMatch[1].toLowerCase() : "unknown"
+      const state = (rawState === "3" || rawState === "idle")         ? "idle"
+                  : (rawState === "4" || rawState === "processing")   ? "processing"
+                  : (rawState === "5" || rawState === "stopped")      ? "stopped"
                   : "unknown"
 
       // printer-state-reasons (can be comma-separated)
-      const reasonsMatch = stdout.match(/printer-state-reasons\s*=\s*(.+)/)
+      const reasonsMatch = stdout.match(/printer-state-reasons\s*[=(]\s*(.+)/)
       const reasonCodes  = reasonsMatch
-        ? reasonsMatch[1].trim().split(/[,\s]+/).map(r => r.trim()).filter(Boolean)
+        ? reasonsMatch[1].trim().split(/[,\s]+/).map(r => r.trim().toLowerCase()).filter(Boolean)
         : ["none"]
       const stateReasons = reasonCodes.map(code => ({
         code,
@@ -472,19 +502,26 @@ async function pollPrinterIPP(printerName) {
       }))
 
       // marker-levels: comma-separated integers (ink/toner %)
-      const inkMatch  = stdout.match(/marker-levels\s*=\s*(.+)/)
+      const inkMatch  = stdout.match(/marker-levels\s*[=(]\s*(.+)/)
       const inkLevels = inkMatch
         ? inkMatch[1].trim().split(",").map(v => parseInt(v.trim(), 10)).filter(n => !isNaN(n) && n >= 0)
         : []
 
+      // marker-names: identifies ink colors (Cyan, Magenta, Yellow, Black)
+      const inkNamesMatch = stdout.match(/marker-names\s*[=(]\s*(.+)/)
+      const inkColors = inkNamesMatch
+        ? inkNamesMatch[1].trim().split(",").map(v => v.trim().replace(/^'|\'$/g, ""))
+        : inkLevels.length === 4 ? ["Cyan", "Magenta", "Yellow", "Black"] : ["Toner"]
+
       // queued-job-count
-      const jobsMatch  = stdout.match(/queued-job-count\s*=\s*(\d+)/)
+      const jobsMatch  = stdout.match(/queued-job-count\s*[=(]\s*(\d+)/)
       const jobsInQueue = jobsMatch ? parseInt(jobsMatch[1], 10) : 0
 
-      const hasError   = stateReasons.some(r => r.severity === "error" && r.code !== "none")
-      const online     = state !== "stopped" || !hasError
+      const hasError = stateReasons.some(r => r.severity === "error" && r.code !== "none")
+      // online = printer is reachable and not in a hard error state
+      const online = !hasError && state !== "stopped"
 
-      resolve({ online, state, stateReasons, inkLevels, jobsInQueue })
+      resolve({ online, state, stateReasons, inkLevels, inkColors, jobsInQueue })
     })
   })
 }
