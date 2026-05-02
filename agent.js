@@ -362,3 +362,13 @@ socket.on("print:retry_job", async ({ printJobId, printerSlot }) => {
 process.on("SIGTERM", () => { socket.disconnect(); process.exit(0) })
 process.on("SIGINT", () => { socket.disconnect(); process.exit(0) })
 process.on("uncaughtException", e => { log.error(e.message); log.error(e.stack) })
+
+
+
+
+
+
+
+
+
+

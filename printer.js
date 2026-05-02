@@ -494,15 +494,21 @@ async function pollPrinterIPP(printerName, printerUrl) {
 
   return new Promise(resolve => {
     execFile("ipptool", ["-tv", ippUrl, testFile], { timeout: 4000 }, (err, stdout, stderr) => {
-      if (err || !stdout) {
-        log.warn(`IPP poll failed for ${printerName}: ${err?.message || stderr}`)
+      // CRITICAL FIX: ipptool exits with code 1 (err != null) whenever a test
+      // assertion fails — this happens even when the printer IS online but has
+      // paper-out, paper-jam, etc. (the -warning codes cause assertion failures).
+      // We must NOT treat a non-zero exit as "offline" if stdout has data.
+      // Only return offline when stdout is completely empty (true connection failure).
+      const hasOutput = stdout && stdout.trim().length > 0
+      if (!hasOutput) {
+        log.warn(`IPP poll: no response from ${printerName} (${ippUrl}): ${err?.message || stderr || "empty output"}`)
         resolve(offline)
         return
       }
 
-      const hasFail = stdout.includes("FAIL")
-      const hasState = stdout.includes("printer-state")
-      if (hasFail && !hasState) {
+      // If printer-state is missing entirely, printer didn't respond properly
+      if (!stdout.includes("printer-state")) {
+        log.warn(`IPP poll: printer-state missing in response from ${printerName}`)
         resolve(offline)
         return
       }
