@@ -3,18 +3,23 @@
  * Polls both printers via IPP every 1 second.
  * Pipelines download+print so next file downloads while current prints.
  * DX: runs color (printer1) and B&W (printer2) groups in parallel.
+ *
+ * FIX: onStatus now maps specific IPP reason codes to specific UI statuses:
+ *   PAPER_OUT, PAPER_JAM, COVER_OPEN, INK_EMPTY, OFFLINE, ERROR
+ * instead of generic ERROR for everything.
+ * Also reads printer-alert-description for human-readable messages.
  */
 
-const fs   = require("fs")
+const fs = require("fs")
 const path = require("path")
 const axios = require("axios")
 const { io } = require("socket.io-client")
-const log     = require("./logger")
+const log = require("./logger")
 const printer = require("./printer")
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG_PATH = process.env.CONFIG_PATH || "/etc/pixelprint/config.json"
-const DEV_CONFIG  = path.join(__dirname, "config.json")
+const DEV_CONFIG = path.join(__dirname, "config.json")
 let config
 try {
   const f = fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : DEV_CONFIG
@@ -22,18 +27,18 @@ try {
   log.info(`Config: ${f}`)
 } catch (e) { log.error(e.message); process.exit(1) }
 
-const KIOSK_ID      = config.kioskId
-const BACKEND       = (config.backendUrl       || "https://printing-pixel-1.onrender.com").replace(/\/$/, "")
-const KIOSK_BACKEND = (config.kioskBackendUrl  || "https://kiosk-backend-t1mi.onrender.com").replace(/\/$/, "")
-const SECRET        = config.secret || "pixelprint-agent-2026"
-const VERSION       = require("./package.json").version
-const PRINTER1      = config.printer1 || null
-const PRINTER2      = config.printer2 || null
-const PRINTER1_URL  = config.printer1Url || null   // e.g. "ipp://172.21.12.37/ipp/print"
-const PRINTER2_URL  = config.printer2Url || null
-const VARIANT       = PRINTER2 ? "DX" : "SX"
+const KIOSK_ID = config.kioskId
+const BACKEND = (config.backendUrl || "https://printing-pixel-1.onrender.com").replace(/\/$/, "")
+const KIOSK_BACKEND = (config.kioskBackendUrl || "https://kiosk-backend-t1mi.onrender.com").replace(/\/$/, "")
+const SECRET = config.secret || "pixelprint-agent-2026"
+const VERSION = require("./package.json").version
+const PRINTER1 = config.printer1 || null
+const PRINTER2 = config.printer2 || null
+const PRINTER1_URL = config.printer1Url || null   // e.g. "ipp://172.21.12.37/ipp/print"
+const PRINTER2_URL = config.printer2Url || null
+const VARIANT = PRINTER2 ? "DX" : "SX"
 
-log.info(`v${VERSION} | ${KIOSK_ID} | ${VARIANT} | P1:${PRINTER1}${PRINTER1_URL ? " ("+PRINTER1_URL+")" : ""} | P2:${PRINTER2 || "N/A"}${PRINTER2_URL ? " ("+PRINTER2_URL+")" : ""}`)
+log.info(`v${VERSION} | ${KIOSK_ID} | ${VARIANT} | P1:${PRINTER1}${PRINTER1_URL ? " (" + PRINTER1_URL + ")" : ""} | P2:${PRINTER2 || "N/A"}${PRINTER2_URL ? " (" + PRINTER2_URL + ")" : ""}`)
 
 // ── Socket ────────────────────────────────────────────────────────────────────
 const socket = io(BACKEND, {
@@ -42,10 +47,10 @@ const socket = io(BACKEND, {
   reconnectionAttempts: Infinity, timeout: 20000
 })
 
-socket.on("connect",       () => { log.info(`Socket connected: ${socket.id}`); socket.emit("kiosk:register", { kioskId: KIOSK_ID, version: VERSION, platform: process.platform, hostname: require("os").hostname() }) })
+socket.on("connect", () => { log.info(`Socket connected: ${socket.id}`); socket.emit("kiosk:register", { kioskId: KIOSK_ID, version: VERSION, platform: process.platform, hostname: require("os").hostname() }) })
 socket.on("connect_error", e => log.error(`Socket error: ${e.message}`))
-socket.on("disconnect",    r => log.warn(`Disconnected: ${r}`))
-socket.on("reconnect",     n => log.info(`Reconnected after ${n} tries`))
+socket.on("disconnect", r => log.warn(`Disconnected: ${r}`))
+socket.on("reconnect", n => log.info(`Reconnected after ${n} tries`))
 
 // ── Heartbeat ─────────────────────────────────────────────────────────────────
 setInterval(() => {
@@ -72,6 +77,45 @@ async function pollAllPrinters() {
 pollAllPrinters()
 setInterval(pollAllPrinters, 1000)
 
+// ── UI Status Mapper ──────────────────────────────────────────────────────────
+/**
+ * Maps IPP reason code → specific UI status string.
+ *
+ * These statuses are emitted in print:printer_progress so the frontend
+ * can show the right message to the user:
+ *
+ *   "PRINTING"    → 🖨️ Printing your document...
+ *   "PAPER_OUT"   → 🔴 Out of paper — please refill
+ *   "PAPER_JAM"   → 🔴 Paper jam — please clear printer
+ *   "COVER_OPEN"  → 🔴 Printer cover is open
+ *   "INK_EMPTY"   → 🔴 Ink / Toner is empty
+ *   "OFFLINE"     → 🔴 Printer is offline
+ *   "COMPLETED"   → ✅ Done!
+ *   "FAILED"      → ❌ Print failed
+ *   "ERROR"       → 🔴 Printer error — check printer
+ */
+function mapCodeToUiStatus(code) {
+  if (!code) return "ERROR"
+  const c = code.toLowerCase()
+
+  if (c.includes("media-empty") || c.includes("media-needed") || c === "input-tray-missing")
+    return "PAPER_OUT"
+
+  if (c.includes("media-jam"))
+    return "PAPER_JAM"
+
+  if (c === "cover-open" || c === "door-open")
+    return "COVER_OPEN"
+
+  if (c.includes("marker-supply-empty") || c.includes("toner-empty") || c.includes("marker-waste-full"))
+    return "INK_EMPTY"
+
+  if (c === "offline-report" || c === "offline" || c === "shutdown")
+    return "OFFLINE"
+
+  return "ERROR"
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function emitPP(printJobId, printerSlot, printerName, status, extra = {}) {
   socket.emit("print:printer_progress", { printJobId, printer: printerSlot, printerName, status, ...extra })
@@ -85,57 +129,67 @@ function countSheets(file) {
 // ── Download + normalize a single file ───────────────────────────────────────
 async function prepareFile(file, workDir, tempFiles) {
   const response = await axios({ method: "GET", url: file.url, responseType: "arraybuffer", timeout: 120_000 })
-  const safeName  = file.originalName.replace(/[^a-zA-Z0-9._-]/g, "_")
-  const rawPath   = path.join(workDir, `${Date.now()}_${safeName}`)
+  const safeName = file.originalName.replace(/[^a-zA-Z0-9._-]/g, "_")
+  const rawPath = path.join(workDir, `${Date.now()}_${safeName}`)
   fs.writeFileSync(rawPath, Buffer.from(response.data))
   tempFiles.push(rawPath)
 
-  const isPdf   = /\.pdf$/i.test(file.originalName) || (file.mimeType || "").includes("pdf")
+  const isPdf = /\.pdf$/i.test(file.originalName) || (file.mimeType || "").includes("pdf")
   const isImage = /\.(jpe?g|png|gif|webp|bmp)$/i.test(file.originalName)
   let processedPath = rawPath
-  if (isPdf)        processedPath = await printer.normalizePdfToA4(rawPath)
+  if (isPdf) processedPath = await printer.normalizePdfToA4(rawPath)
   else if (isImage) processedPath = await printer.imageToA4Pdf(rawPath)
   if (processedPath !== rawPath) tempFiles.push(processedPath)
   return processedPath
 }
 
 // ── Per-printer pipeline: download next while current prints ──────────────────
-async function runPrinterGroup({ printJobId, files, printerName, printerSlot }) {
-  const workDir   = printer.getWorkDir()
+async function runPrinterGroup({ printJobId, files, printerName, printerSlot, printerUrl }) {
+  const workDir = printer.getWorkDir()
   const tempFiles = []
-  const results   = []
-  let   sheets    = 0
+  const results = []
+  let sheets = 0
   const filesTotal = files.length
 
   // Emit QUEUED for all files upfront so frontend knows total count
-  emitPP(printJobId, printerSlot, printerName, "QUEUED", { filesDone: 0, filesTotal, pagesDone: 0, pagesTotal: 0, currentFile: null, error: null })
+  emitPP(printJobId, printerSlot, printerName, "QUEUED", {
+    filesDone: 0, filesTotal, pagesDone: 0, pagesTotal: 0,
+    currentFile: null, error: null
+  })
 
   // Start downloading file[0] immediately
-  let nextPreparePromise = prepareFile(files[0], workDir, tempFiles).catch(e => { throw new Error(`Download failed: ${e.message}`) })
+  let nextPreparePromise = prepareFile(files[0], workDir, tempFiles)
+    .catch(e => { throw new Error(`Download failed: ${e.message}`) })
 
   for (let i = 0; i < files.length; i++) {
-    const file       = files[i]
+    const file = files[i]
     const pagesTotal = (file.pageCount || 1) * (file.printOptions?.copies || 1)
 
-    // Wait for current file to be ready (already in flight)
+    // Wait for current file to be ready
     let processedPath
     try {
       processedPath = await nextPreparePromise
     } catch (err) {
       log.error(`[${printerSlot}] Prepare failed [${i}]: ${err.message}`)
-      // Start preparing next file even if this one failed
-      if (i + 1 < files.length) nextPreparePromise = prepareFile(files[i + 1], workDir, tempFiles).catch(e => { throw new Error(`Download failed: ${e.message}`) })
-      emitPP(printJobId, printerSlot, printerName, "FAILED", { filesDone: i, filesTotal, pagesTotal, currentFile: file.originalName, error: err.message })
+      if (i + 1 < files.length) {
+        nextPreparePromise = prepareFile(files[i + 1], workDir, tempFiles)
+          .catch(e => { throw new Error(`Download failed: ${e.message}`) })
+      }
+      emitPP(printJobId, printerSlot, printerName, "FAILED", {
+        filesDone: i, filesTotal, pagesTotal,
+        currentFile: file.originalName, error: err.message
+      })
       results.push({ filename: file.originalName, success: false, error: err.message })
       continue
     }
 
     // File is ready — immediately kick off download of next file in parallel
     if (i + 1 < files.length) {
-      nextPreparePromise = prepareFile(files[i + 1], workDir, tempFiles).catch(e => { throw new Error(`Download failed: ${e.message}`) })
+      nextPreparePromise = prepareFile(files[i + 1], workDir, tempFiles)
+        .catch(e => { throw new Error(`Download failed: ${e.message}`) })
     }
 
-    // Emit PRINTING (customer sees this — not downloading)
+    // Emit PRINTING (user sees this — not "downloading")
     emitPP(printJobId, printerSlot, printerName, "PRINTING", {
       filesDone: i, filesTotal, pagesDone: 0, pagesTotal,
       currentFile: file.originalName, error: null
@@ -147,22 +201,40 @@ async function runPrinterGroup({ printJobId, files, printerName, printerSlot }) 
 
       if (jobId) {
         await printer.waitForCupsJob(jobId, {
-          timeoutMs:   300_000,
-          intervalMs:  1000,
+          timeoutMs: 300_000,
+          intervalMs: 1000,
           printerName: printerName,
-          onStatus: ({ state, reason, code, active }) => {
+          printerUrl: printerUrl,    // FIX: pass LAN URL so IPP polling uses direct printer IP
+          onStatus: ({ state, reason, code, active, alertDescription, inkLevels, inkColors }) => {
+            // ── FIX: Map specific IPP codes to specific UI statuses ────────
             let uiStatus = "PRINTING"
-            let uiError  = null
-            if (state === "stopped" || state === "held") {
-              uiStatus = "ERROR"
-              uiError  = reason || "Printer error — check printer panel"
-            } else if (!active) {
+            let uiError = null
+
+            if (!active) {
+              // Job left the queue — it's done
               uiStatus = "COMPLETED"
+            } else if (state === "stopped" || state === "held") {
+              // Map specific hardware issue → specific UI status
+              uiStatus = mapCodeToUiStatus(code)
+              // Use printer-alert-description if available (most human-readable)
+              // e.g. Epson sends "paper out" as alert-description
+              uiError = alertDescription || reason || "Printer error — check printer panel"
             }
+
+            log.debug(`[${printerSlot}] onStatus: state=${state} code=${code} uiStatus=${uiStatus}`)
+
             emitPP(printJobId, printerSlot, printerName, uiStatus, {
-              filesDone: i, filesTotal, pagesTotal,
+              filesDone: i,
+              filesTotal,
+              pagesTotal,
               currentFile: uiStatus === "COMPLETED" ? null : file.originalName,
-              error: uiError, errorCode: code || null, cupsJobId: jobId, cupsState: state
+              error: uiError,
+              errorCode: code || null,
+              cupsJobId: jobId,
+              cupsState: state,
+              // FIX: Also emit ink levels with every status update
+              inkLevels: inkLevels || [],
+              inkColors: inkColors || [],
             })
           }
         })
@@ -202,16 +274,16 @@ socket.on("print:job", async (job) => {
   socket.emit("print:ack", { printJobId, kioskId: KIOSK_ID })
 
   const colorFiles = files.filter(f => (f.printOptions?.colorMode || "bw") === "color")
-  const bwFiles    = files.filter(f => (f.printOptions?.colorMode || "bw") !== "color")
+  const bwFiles = files.filter(f => (f.printOptions?.colorMode || "bw") !== "color")
 
   const groups = VARIANT === "SX"
-    ? [{ printerSlot: "printer1", printerName: PRINTER1, files }]
+    ? [{ printerSlot: "printer1", printerName: PRINTER1, printerUrl: PRINTER1_URL, files }]
     : [
-        ...(colorFiles.length > 0 ? [{ printerSlot: "printer1", printerName: PRINTER1, files: colorFiles }] : []),
-        ...(bwFiles.length    > 0 ? [{ printerSlot: "printer2", printerName: PRINTER2 || PRINTER1, files: bwFiles }] : []),
-      ].filter(Boolean)
+      ...(colorFiles.length > 0 ? [{ printerSlot: "printer1", printerName: PRINTER1, printerUrl: PRINTER1_URL, files: colorFiles }] : []),
+      ...(bwFiles.length > 0 ? [{ printerSlot: "printer2", printerName: PRINTER2 || PRINTER1, printerUrl: PRINTER2_URL || PRINTER1_URL, files: bwFiles }] : []),
+    ].filter(Boolean)
 
-  if (groups.length === 0) groups.push({ printerSlot: "printer1", printerName: PRINTER1, files })
+  if (groups.length === 0) groups.push({ printerSlot: "printer1", printerName: PRINTER1, printerUrl: PRINTER1_URL, files })
 
   let allResults = [], sheetsP1 = 0, sheetsP2 = 0
   try {
@@ -288,5 +360,5 @@ socket.on("print:retry_job", async ({ printJobId, printerSlot }) => {
 })
 
 process.on("SIGTERM", () => { socket.disconnect(); process.exit(0) })
-process.on("SIGINT",  () => { socket.disconnect(); process.exit(0) })
+process.on("SIGINT", () => { socket.disconnect(); process.exit(0) })
 process.on("uncaughtException", e => { log.error(e.message); log.error(e.stack) })
