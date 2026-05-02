@@ -29,9 +29,11 @@ const SECRET        = config.secret || "pixelprint-agent-2026"
 const VERSION       = require("./package.json").version
 const PRINTER1      = config.printer1 || null
 const PRINTER2      = config.printer2 || null
+const PRINTER1_URL  = config.printer1Url || null   // e.g. "ipp://172.21.12.37/ipp/print"
+const PRINTER2_URL  = config.printer2Url || null
 const VARIANT       = PRINTER2 ? "DX" : "SX"
 
-log.info(`v${VERSION} | ${KIOSK_ID} | ${VARIANT} | P1:${PRINTER1} | P2:${PRINTER2 || "N/A"}`)
+log.info(`v${VERSION} | ${KIOSK_ID} | ${VARIANT} | P1:${PRINTER1}${PRINTER1_URL ? " ("+PRINTER1_URL+")" : ""} | P2:${PRINTER2 || "N/A"}${PRINTER2_URL ? " ("+PRINTER2_URL+")" : ""}`)
 
 // ── Socket ────────────────────────────────────────────────────────────────────
 const socket = io(BACKEND, {
@@ -54,12 +56,12 @@ setInterval(() => {
 async function pollAllPrinters() {
   try {
     const [p1, p2] = await Promise.all([
-      PRINTER1 ? printer.pollPrinterIPP(PRINTER1) : null,
-      PRINTER2 ? printer.pollPrinterIPP(PRINTER2) : null,
+      PRINTER1 ? printer.pollPrinterIPP(PRINTER1, PRINTER1_URL) : null,
+      PRINTER2 ? printer.pollPrinterIPP(PRINTER2, PRINTER2_URL) : null,
     ])
     const printers = {}
-    if (p1) printers.printer1 = { name: PRINTER1, ...p1 }
-    if (p2) printers.printer2 = { name: PRINTER2, ...p2 }
+    if (p1) printers.printer1 = { name: PRINTER1, url: PRINTER1_URL, ...p1 }
+    if (p2) printers.printer2 = { name: PRINTER2, url: PRINTER2_URL, ...p2 }
     socket.emit("kiosk:printer_status", { kioskId: KIOSK_ID, printers, timestamp: new Date().toISOString() })
   } catch (e) {
     log.warn(`IPP poll error: ${e.message}`)
